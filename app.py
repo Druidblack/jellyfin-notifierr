@@ -38,6 +38,7 @@ MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
 TMDB_API_KEY = os.environ["TMDB_API_KEY"]
 TMDB_V3_BASE = "https://api.themoviedb.org/3"
 TMDB_TRAILER_LANG = os.getenv("TMDB_TRAILER_LANG", "en-US")  # пример: ru-RU, sv-SE, en-US
+INCLUDE_MEDIA_TECH_INFO = os.getenv("INCLUDE_MEDIA_TECH_INFO", "true").strip().lower() in ("1","true","yes","y","on")
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -113,7 +114,7 @@ def get_item_details(item_id):
     # Добавили ProviderIds и ExternalUrls — здесь будет TMDb ID
     url = (
         f"{JELLYFIN_BASE_URL}/emby/Items"
-        f"?Recursive=true&Fields=DateCreated,Overview,ProviderIds,ExternalUrls&Ids={item_id}"
+        f"?Recursive=true&Fields=DateCreated,Overview,ProviderIds,ExternalUrls,MediaStreams,MediaSources&Ids={item_id}"
     )
     response = requests.get(url, headers=headers, params=params, timeout=10)
     response.raise_for_status()
@@ -232,6 +233,168 @@ def get_tmdb_trailer_url(media_type: str, tmdb_id: str | int, preferred_lang: st
     # Фолбэк: попробуем выбрать лучший из суммарного списка
     return _pick_best_tmdb_video(all_results, preferred_iso=pref_iso)
 
+# Добавление технической информации в сообщение о новом фильме
+def _channels_to_layout(channels: int | None) -> str:
+    if not channels:
+        return "?"
+    # Желаемое человекочитаемое: 2 -> 2.0, 6 -> 5.1, 8 -> 7.1
+    if channels == 6:  return "5.1"
+    if channels == 8:  return "7.1"
+    if channels == 2:  return "2.0"
+    return str(channels)
+
+def _normalize_codec(codec: str | None) -> str:
+    if not codec:
+        return "?"
+    c = codec.lower()
+    if c in ("hevc","h265","x265"): return "HEVC (H.265)"
+    if c in ("h264","avc","x264"):  return "AVC (H.264)"
+    if c in ("av1",):               return "AV1"
+    if c in ("vp9",):               return "VP9"
+    return codec.upper()
+
+def _detect_image_profile(vs: dict) -> str:
+    """
+    Пытаемся красиво отобразить профиль изображения: Dolby Vision / HDR10 / HDR10+ / HLG / SDR.
+    Jellyfin обычно даёт поля VideoRange/VideoRangeType; если есть профиль DV — подцепим.
+    """
+    rng = (vs.get("VideoRange") or "").upper()      # например: HDR10, SDR, DOLBY VISION
+    rtype = (vs.get("VideoRangeType") or "").upper()  # например: DOVI, HDR10, HLG
+    profile_hint = ""
+    # иногда профиль DV встречается в полях типа 'DolbyVisionProfile', 'DvProfile', 'VideoDoViProfile'…
+    for k, v in (vs or {}).items():
+        if "profile" in k.lower() and isinstance(v, (str, int)):
+            profile_hint = f" Profile {v}"
+            break
+
+    if "DOVI" in rtype or "DOLBY" in rng:
+        return f"Dolby Vision{profile_hint}"
+    if "HDR10+" in rng or "HDR10+" in rtype:
+        return "HDR10+"
+    if "HDR10" in rng or "HDR10" in rtype:
+        return "HDR10"
+    if "HLG" in rng or "HLG" in rtype:
+        return "HLG"
+    # если ничего явного — считаем SDR
+    return "SDR"
+
+def build_movie_media_tech_text(details_json: dict) -> str:
+    """
+    Собирает блок:
+      *Quality:*
+      - Resolution: 4K (3840×1600)
+      - Video codec: HEVC (H.265)
+      - Image profiles: Dolby Vision
+      *Audio tracks:*
+      - EAC3 5.1 (Atmos)
+      - DTS-HD MA 7.1 (en)
+    """
+    try:
+        items = details_json.get("Items") or []
+        if not items:
+            return ""
+        item = items[0]
+
+        # потоки могут быть прямо в Item.MediaStreams или внутри MediaSources[].MediaStreams
+        streams = (item.get("MediaStreams") or [])
+        if not streams:
+            for ms in (item.get("MediaSources") or []):
+                if ms.get("MediaStreams"):
+                    streams = ms["MediaStreams"]
+                    break
+        if not streams:
+            return ""
+
+        # ---- Видео ----
+        video_streams = [s for s in streams if (s.get("Type") or "").lower() == "video"]
+        vs = video_streams[0] if video_streams else {}
+        width  = vs.get("Width")
+        height = vs.get("Height")
+
+        res_label = _resolution_label(width, height)
+        vcodec = _normalize_codec(vs.get("Codec"))
+        img_profile = _detect_image_profile(vs)
+
+        quality_block = (
+            "*Quality:*\n"
+            f"- Resolution: {res_label}\n"
+            f"- Video codec: {vcodec}\n"
+            f"- Image profiles: {img_profile}"
+        )
+
+        # ---- Аудио ----
+        audio_streams = [s for s in streams if (s.get("Type") or "").lower() == "audio"]
+        if audio_streams:
+            audio_lines = []
+            for a in audio_streams:
+                # jellyfin часто уже даёт «DisplayTitle» вида "DTS-HD MA 7.1 (eng)" и т.п.
+                acodec_disp = (a.get("DisplayTitle") or "").strip()
+                is_atmos = a.get("IsAtmos") or ("ATMOS" in acodec_disp.upper())
+
+                if acodec_disp:
+                    # НЕ добавляем префикс "ru:"/"rus:" — как просили
+                    line = acodec_disp
+                    if is_atmos and "atmos" not in acodec_disp.lower():
+                        line += " (Atmos)"
+                else:
+                    base = _normalize_codec(a.get("Codec"))
+                    ch   = _channels_to_layout(a.get("Channels"))
+                    lang = a.get("Language") or "und"
+                    line = f"{base} {ch} ({lang})"
+                    if is_atmos:
+                        line += " (Atmos)"
+
+                audio_lines.append(f"- {line}")
+
+            audio_block = "*Audio tracks:*\n" + "\n".join(audio_lines)
+        else:
+            audio_block = "*Audio tracks:*\n- n/a"
+
+        return f"\n\n{quality_block}\n\n{audio_block}"
+    except Exception as e:
+        logging.warning(f"Failed to build media tech text: {e}")
+        return ""
+
+
+def _resolution_label(width: int | None, height: int | None) -> str:
+    """
+    Возвращает человекочитаемую метку разрешения с учётом широкоформатных кадров и
+    небольших отклонений от стандартов. Примеры:
+      3840x1600 -> 4K (3840×1600)
+      1920x800  -> 1080p (1920×800)
+      7680x4320 -> 8K (7680×4320)
+    """
+    if not width or not height:
+        return "?"
+
+    w, h = int(width), int(height)
+    # Толеранс по «старшему» измерению ~2%
+    # Используем оба измерения, чтобы корректно ловить широкоформат (3840×1600 и т.п.)
+    def label():
+        if w >= 7600 or h >= 4300:
+            return "8K"
+        # (опционально можно оставить «5K», но обычно достаточно 4K)
+        if w >= 3800 or h >= 2100:
+            return "4K"
+        # 2K DCI (2048×1080) часто встречается; пометим отдельно
+        if (2000 <= w < 2560) and (1000 <= h < 1440):
+            return "2K"
+        if w >= 2500 or h >= 1400:
+            return "1440p"
+        if w >= 1900 or h >= 1060:
+            return "1080p"
+        if w >= 1200 or h >= 700:
+            return "720p"
+        # SD варианты
+        if h >= 560:
+            return "576p"
+        if h >= 470:
+            return "480p"
+        return f"{h}p"
+
+    # знак умножения × — аккуратнее, чем "x"
+    return f"{label()} ({w}×{h})"
+
 
 
 @app.route("/webhook", methods=["POST"])
@@ -259,6 +422,16 @@ def announce_new_releases_from_jellyfin():
                 notification_message = (
                     f"*🍿New Movie Added🍿*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
                     f"Runtime\n{runtime}")
+
+                # Добавляем блок качества/аудио (опционально, по умолчанию включено)
+                if INCLUDE_MEDIA_TECH_INFO:
+                    try:
+                        movie_details = get_item_details(movie_id)
+                        tech_text = build_movie_media_tech_text(movie_details)
+                        if tech_text:
+                            notification_message += tech_text
+                    except Exception as e:
+                        logging.warning(f"Could not append media tech info: {e}")
 
                 if tmdb_id:
                     # приводим тип к тому, что ждёт MDblist: movie или series
