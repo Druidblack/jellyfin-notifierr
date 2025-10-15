@@ -37,37 +37,6 @@ JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
 YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
 TMDB_API_KEY = os.environ["TMDB_API_KEY"]
-TMDB_SEARCH_URL = "https://api.themoviedb.org/3/search/tv"
-EPISODE_PREMIERED_WITHIN_X_DAYS = int(os.environ["EPISODE_PREMIERED_WITHIN_X_DAYS"])
-SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
-#выключить логику пропуска по датам
-#DEBUG_DISABLE_DATE_CHECKS = True
-
-# Path for the JSON file to store notified items
-notified_items_file = 'A:/notifierr/notified_items.json'
-
-# Убедимся, что папка /app/data существует
-os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
-
-# Function to load notified items from the JSON file
-def load_notified_items():
-    # Если файл есть — читаем
-    if os.path.exists(notified_items_file):
-        with open(notified_items_file, 'r', encoding='utf-8') as file:
-            return json.load(file)
-    # Иначе — создаём пустой JSON и возвращаем пустой словарь
-    with open(notified_items_file, 'w', encoding='utf-8') as file:
-        json.dump({}, file, ensure_ascii=False, indent=2)
-    return {}
-
-# Function to save notified items to the JSON file
-def save_notified_items(notified_items_to_save):
-    with open(notified_items_file, 'w', encoding='utf-8') as file:
-        json.dump(notified_items_to_save, file, ensure_ascii=False, indent=2)
-
-
-notified_items = load_notified_items()
-
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -201,20 +170,6 @@ def _parse_date_any(date_str: str):
         return None
 
 
-def is_within_last_x_days(date_str: str, x: int) -> bool:
-    dt = _parse_date_any(date_str)
-    if not dt:
-        return False
-    return dt >= (datetime.now() - timedelta(days=x))
-
-
-def is_not_within_last_x_days(date_str: str, x: int) -> bool:
-    dt = _parse_date_any(date_str)
-    if not dt:
-        return True
-    return dt < (datetime.now() - timedelta(days=x))
-
-
 def get_youtube_trailer_url(query):
     base_search_url = "https://www.googleapis.com/youtube/v3/search"
     if not YOUTUBE_API_KEY:
@@ -236,27 +191,6 @@ def get_youtube_trailer_url(query):
     return f"https://www.youtube.com/watch?v={video_id}" if video_id else "Video not found!"
 
 
-def item_already_notified(item_type, item_name, release_year):
-    key = f"{item_type}:{item_name}:{release_year}"
-    return key in notified_items
-
-
-def mark_item_as_notified(item_type, item_name, release_year, max_entries=100):
-    key = f"{item_type}:{item_name}:{release_year}"
-    notified_items[key] = True
-
-    # Если превысили лимит — удаляем самый старый ключ (порядок вставки у dict сохраняется в Py3.7+)
-    if len(notified_items) > max_entries:
-        try:
-            oldest_key = next(iter(notified_items))
-            del notified_items[oldest_key]
-            logging.info(f"Key '{oldest_key}' has been deleted from notified_items")
-        except StopIteration:
-            pass
-    # Save the updated notified items to the JSON file
-    save_notified_items(notified_items)
-
-
 @app.route("/webhook", methods=["POST"])
 def announce_new_releases_from_jellyfin():
     try:
@@ -270,7 +204,6 @@ def announce_new_releases_from_jellyfin():
         season_num = payload.get("SeasonNumber00")
 
         if item_type == "Movie":
-            if not item_already_notified(item_type, item_name, release_year):
                 movie_id = payload.get("ItemId")
                 overview = payload.get("Overview")
                 runtime = payload.get("RunTime")
@@ -295,13 +228,11 @@ def announce_new_releases_from_jellyfin():
                     notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
 
                 send_telegram_photo(movie_id, notification_message)
-                mark_item_as_notified(item_type, item_name, release_year)
                 logging.info(f"(Movie) {movie_name} {release_year} "
                              f"notification was sent to telegram.")
                 return "Movie notification was sent to telegram"
 
         if item_type == "Season":
-            if not item_already_notified(item_type, item_name, release_year):
                 season_id = payload.get("ItemId")
                 season = item_name
                 season_details = get_item_details(season_id)
@@ -337,67 +268,46 @@ def announce_new_releases_from_jellyfin():
                 response = send_telegram_photo(season_id, notification_message)
 
                 if response.status_code == 200:
-                    mark_item_as_notified(item_type, item_name, release_year)
                     logging.info(f"(Season) {series_name_cleaned} {season} "
                                  f"notification was sent to telegram.")
                     return "Season notification was sent to telegram"
                 else:
                     send_telegram_photo(series_id, notification_message)
-                    mark_item_as_notified(item_type, item_name, release_year)
                     logging.warning(f"{series_name_cleaned} {season} image does not exists, falling back to series image")
                     logging.info(f"(Season) {series_name_cleaned} {season} notification was sent to telegram")
                     return "Season notification was sent to telegram"
 
         if item_type == "Episode":
-            if not item_already_notified(item_type, item_name, release_year):
                 item_id = payload.get("ItemId")
                 file_details = get_item_details(item_id)
                 season_id = file_details["Items"][0].get("SeasonId")
-                episode_premiere_date = file_details["Items"][0].get("PremiereDate", "0000-00-00T").split("T")[0]
                 season_details = get_item_details(season_id)
                 series_id = season_details["Items"][0].get("SeriesId")
-                season_date_created = season_details["Items"][0].get("DateCreated", "0000-00-00T").split("T")[0]
                 epi_name = item_name
-                overview = payload.get("Overview")
+                overview = payload.get("Overview") or ""
+                season_epi = payload.get("EpisodeNumber00")
+                season_num = payload.get("SeasonNumber00")
 
-#                if not DEBUG_DISABLE_DATE_CHECKS:
-                if not is_not_within_last_x_days(season_date_created, SEASON_ADDED_WITHIN_X_DAYS):
-                    logging.info(f"(Episode) {series_name} Season {season_num} "
-                                 f"was added within the last {SEASON_ADDED_WITHIN_X_DAYS} "
-                                 f"days. Not sending notification.")
-                    return (f"Season was added within the last {SEASON_ADDED_WITHIN_X_DAYS} "
-                            f"days. Not sending notification.")
+                # дата теперь не фильтрует отправку, используем её только как справочную
+                episode_premiere_date = (file_details["Items"][0].get("PremiereDate", "0000-00-00T").split("T")[0])
 
-                if episode_premiere_date and is_within_last_x_days(episode_premiere_date,
-                                                                   EPISODE_PREMIERED_WITHIN_X_DAYS):
-
-                    notification_message = (
+                notification_message = (
                         f"*New Episode Added*\n\n*Release Date*: {episode_premiere_date}\n\n*Series*: {series_name} *S*"
                         f"{season_num}*E*{season_epi}\n*Episode Title*: {epi_name}\n\n{overview}\n\n"
                     )
-                    response = send_telegram_photo(season_id, notification_message)
+                response = send_telegram_photo(season_id, notification_message)
 
-                    if response.status_code == 200:
-                        mark_item_as_notified(item_type, item_name, release_year)
+                if response.status_code == 200:
                         logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
                         return "Notification sent to Telegram!"
-                    else:
+                else:
                         send_telegram_photo(series_id, notification_message)
                         logging.warning(f"(Episode) {series_name} season image does not exists, "
                                         f"falling back to series image")
-                        mark_item_as_notified(item_type, item_name, release_year)
                         logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
                         return "Notification sent to Telegram!"
 
-                else:
-                    logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} "
-                                 f"was premiered more than {EPISODE_PREMIERED_WITHIN_X_DAYS} "
-                                 f"days ago. Not sending notification.")
-                    return (f"Episode was added more than {EPISODE_PREMIERED_WITHIN_X_DAYS} "
-                            f"days ago. Not sending notification.")
-
         if item_type == "MusicAlbum":
-            if not item_already_notified(item_type, item_name, release_year):
                 album_id = payload.get("ItemId")
                 album_name = payload.get("Name")
                 artist = payload.get("Artist")
@@ -422,8 +332,6 @@ def announce_new_releases_from_jellyfin():
                 # Отправляем обложку альбома, если есть, иначе ничего страшного
                 response = send_telegram_photo(album_id, notification_message)
 
-                # Фиксируем уведомление как отправленное
-                mark_item_as_notified(item_type, item_name, release_year)
 
                 if response.status_code == 200:
                     logging.info(f"(Album) {artist} – {album_name} ({year}) notification sent.")
