@@ -34,9 +34,10 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"]
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
-YOUTUBE_API_KEY = os.environ["YOUTUBE_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
 TMDB_API_KEY = os.environ["TMDB_API_KEY"]
+TMDB_V3_BASE = "https://api.themoviedb.org/3"
+TMDB_TRAILER_LANG = os.getenv("TMDB_TRAILER_LANG", "en-US")  # пример: ru-RU, sv-SE, en-US
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -152,43 +153,85 @@ def extract_tmdb_id_from_jellyfin_details(details) -> str | None:
         logging.warning(f"Failed to extract TMDb ID from Jellyfin details: {e}")
         return None
 
+#Поиск трейлеров на tmdb
+def _iso639_1(lang_code: str) -> str:
+    """Из 'ru-RU' -> 'ru', из 'sv-SE' -> 'sv', из 'en' -> 'en'."""
+    return (lang_code or "en").split("-")[0].lower()
 
 
-def _parse_date_any(date_str: str):
+def _pick_best_tmdb_video(results: list, preferred_iso: str | None = None) -> str | None:
     """
-    Принимает 'YYYY-MM-DD' или 'YYYY-MM-DDTHH:MM:SS[Z]'.
-    Возвращает datetime или None, если распарсить не удалось.
+    Отдаём лучшую ссылку на трейлер (YouTube приоритет).
+    Приоритет: YouTube → type=Trailer → official=True → совпадение языка → самый новый.
+    Возвращает https://www.youtube.com/watch?v=KEY или None.
     """
-    if not date_str:
+    if not results:
         return None
-    try:
-        # Отрежем время, если прилетело '...T...'
-        if "T" in date_str:
-            date_str = date_str.split("T")[0]
-        return datetime.strptime(date_str, "%Y-%m-%d")
-    except ValueError:
+    preferred_iso = (preferred_iso or "en").lower()
+
+    def score(v: dict) -> tuple:
+        site = (v.get("site") or "").lower()
+        vtype = (v.get("type") or "").lower()
+        official = bool(v.get("official"))
+        lang = (v.get("iso_639_1") or "").lower()
+        # published_at может отсутствовать
+        published = v.get("published_at") or v.get("publishedAt") or ""
+        # Чем больше — тем лучше
+        return (
+            1 if site == "youtube" else 0,
+            2 if vtype == "trailer" else (1 if vtype == "teaser" else 0),
+            1 if official else 0,
+            1 if lang == preferred_iso else 0,
+            published   # строковое сравнение по ISO-датам работает адекватно
+        )
+
+    # Сортируем по приоритету и берём лучший
+    best = sorted(results, key=score, reverse=True)[0]
+    if (best.get("site") or "").lower() == "youtube" and best.get("key"):
+        return f"https://www.youtube.com/watch?v={best['key']}"
+    return None
+
+
+def get_tmdb_trailer_url(media_type: str, tmdb_id: str | int, preferred_lang: str | None = None) -> str | None:
+    """
+    Возвращает URL трейлера с TMDB для movie/tv c фолбэком языка:
+    1) preferred_lang (+ include_video_language=iso,en,null)
+    2) en-US (+ include_video_language=en,null)
+    3) без фильтра языка (любой доступный)
+    """
+    if not tmdb_id:
         return None
 
+    media = "movie" if str(media_type).lower() == "movie" else "tv"
+    url = f"{TMDB_V3_BASE}/{media}/{tmdb_id}/videos"
+    pref = preferred_lang or "en-US"
+    pref_iso = _iso639_1(pref)
 
-def get_youtube_trailer_url(query):
-    base_search_url = "https://www.googleapis.com/youtube/v3/search"
-    if not YOUTUBE_API_KEY:
-        return None
-    api_key = YOUTUBE_API_KEY
+    tries = [
+        {"language": pref,   "include_video_language": f"{pref_iso},en,null"},
+        {"language": "en-US","include_video_language": "en,null"},
+        {}  # последний запрос — без language (возьмём всё, что есть)
+    ]
 
-    params = {
-        'part': 'snippet',
-        'q': query,
-        'type': 'video',
-        'key': api_key
-    }
+    all_results = []
+    for params in tries:
+        params = {**params, "api_key": TMDB_API_KEY}
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            r.raise_for_status()
+            data = r.json() or {}
+            results = data.get("results") or []
+            all_results.extend(results)
+            # если именно на этом шаге уже есть «лучший» — можно вернуть сразу
+            best_here = _pick_best_tmdb_video(results, preferred_iso=pref_iso)
+            if best_here:
+                return best_here
+        except requests.RequestException as e:
+            logging.warning(f"TMDB videos fetch failed ({media}/{tmdb_id}, {params}): {e}")
 
-    response = requests.get(base_search_url, params=params, timeout=10)
-    response.raise_for_status()  # Check for HTTP errors before processing the data
-    response_data = response.json()
-    video_id = response_data.get("items", [{}])[0].get('id', {}).get('videoId')
+    # Фолбэк: попробуем выбрать лучший из суммарного списка
+    return _pick_best_tmdb_video(all_results, preferred_iso=pref_iso)
 
-    return f"https://www.youtube.com/watch?v={video_id}" if video_id else "Video not found!"
 
 
 @app.route("/webhook", methods=["POST"])
@@ -211,7 +254,7 @@ def announce_new_releases_from_jellyfin():
                 movie_name = item_name
                 movie_name_cleaned = movie_name.replace(f" ({release_year})", "").strip()
 
-                trailer_url = get_youtube_trailer_url(f"{movie_name_cleaned} Trailer {release_year}")
+                trailer_url = get_tmdb_trailer_url("movie", tmdb_id, TMDB_TRAILER_LANG)
 
                 notification_message = (
                     f"*🍿New Movie Added🍿*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
@@ -241,7 +284,13 @@ def announce_new_releases_from_jellyfin():
                 # Remove release_year from series_name if present
                 series_name_cleaned = series_name.replace(f" ({release_year})", "").strip()
 
-                trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
+                try:
+                    series_tmdb_id = extract_tmdb_id_from_jellyfin_details(series_details)
+                except NameError:
+                    # если helper ещё не добавлен — используем то, что пришло из вебхука
+                    series_tmdb_id = payload.get("Provider_tmdb")
+
+                trailer_url = get_tmdb_trailer_url("tv", series_tmdb_id, TMDB_TRAILER_LANG)
 
                 # Get TMDb ID via external API
                 tmdb_id = extract_tmdb_id_from_jellyfin_details(series_details)
