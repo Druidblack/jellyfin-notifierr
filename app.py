@@ -13,7 +13,7 @@ load_dotenv()
 app = Flask(__name__)
 
 # Set up logging
-log_directory = '/app/log'
+log_directory = 'A:/notifierr/log'
 log_filename = os.path.join(log_directory, 'jellyfin_telegram-notifier.log')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -44,7 +44,7 @@ SEASON_ADDED_WITHIN_X_DAYS = int(os.environ["SEASON_ADDED_WITHIN_X_DAYS"])
 #DEBUG_DISABLE_DATE_CHECKS = True
 
 # Path for the JSON file to store notified items
-notified_items_file = '/app/data/notified_items.json'
+notified_items_file = 'A:/notifierr/notified_items.json'
 
 # Убедимся, что папка /app/data существует
 os.makedirs(os.path.dirname(notified_items_file), exist_ok=True)
@@ -99,68 +99,120 @@ def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
         app.logger.warning(f"MDblist API error for {content_type}/{tmdb_id}: {e}")
         return ""
 
-def get_tmdb_id(series_name: str, release_year: int) -> str:
-    """
-    Поиск сериала в TMDb и возврат первого найденного TV ID.
-    Если ничего не найдено — возвращает "N/A".
-    """
-    params = {
-        "api_key": TMDB_API_KEY,
-        "query": series_name,
-        "first_air_date_year": release_year,
-        "language": "en-US",
-        "page": 1
-    }
-    try:
-        resp = requests.get(TMDB_SEARCH_URL, params=params)
-        resp.raise_for_status()
-        data = resp.json()
-        results = data.get("results", [])
-        if not results:
-            logging.warning(f"TMDb: не найден сериал «{series_name} ({release_year})»")
-            return "N/A"
-        return str(results[0]["id"])
-    except requests.RequestException as e:
-        logging.error(f"Ошибка при запросе TMDb для «{series_name}»: {e}")
-        return "N/A"
-
 def send_telegram_photo(photo_id, caption):
-    base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images"
-    primary_photo_url = f"{base_photo_url}/Primary"
+    base_photo_url = f"{JELLYFIN_BASE_URL}/Items/{photo_id}/Images/Primary"
 
-    # Download the image from the jellyfin
-    image_response = requests.get(primary_photo_url)
+    # 1) Пытаемся скачать картинку у Jellyfin c api_key и таймаутом
+    try:
+        image_response = requests.get(
+            base_photo_url,
+            params={"api_key": JELLYFIN_API_KEY},
+            timeout=10
+        )
+    except requests.RequestException as e:
+        app.logger.warning(f"Failed to fetch JF image: {e}")
+        image_response = None
 
-    # Upload the image to the Telegram bot
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    data = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "caption": caption,
-        "parse_mode": "Markdown"
-    }
+    # 2) Если картинка есть — шлём фото, иначе — текстом
+    tg_base = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+    if image_response is not None and image_response.ok:
+        url = f"{tg_base}/sendPhoto"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": caption,
+            "parse_mode": "Markdown",
+        }
+        files = {"photo": ("photo.jpg", image_response.content, "image/jpeg")}
+        response = requests.post(url, data=data, files=files, timeout=15)
+    else:
+        app.logger.warning("JF image not available, sending text-only message")
+        url = f"{tg_base}/sendMessage"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": caption,
+            "parse_mode": "Markdown",
+        }
+        response = requests.post(url, data=data, timeout=15)
 
-    files = {'photo': ('photo.jpg', image_response.content, 'image/jpeg')}
-    response = requests.post(url, data=data, files=files)
     return response
 
 
 def get_item_details(item_id):
-    headers = {'accept': 'application/json', }
-    params = {'api_key': JELLYFIN_API_KEY, }
-    url = f"{JELLYFIN_BASE_URL}/emby/Items?Recursive=true&Fields=DateCreated, Overview&Ids={item_id}"
-    response = requests.get(url, headers=headers, params=params)
-    response.raise_for_status()  # Check if request was successful
+    headers = {'accept': 'application/json'}
+    params = {'api_key': JELLYFIN_API_KEY}
+    # Добавили ProviderIds и ExternalUrls — здесь будет TMDb ID
+    url = (
+        f"{JELLYFIN_BASE_URL}/emby/Items"
+        f"?Recursive=true&Fields=DateCreated,Overview,ProviderIds,ExternalUrls&Ids={item_id}"
+    )
+    response = requests.get(url, headers=headers, params=params, timeout=10)
+    response.raise_for_status()
     return response.json()
 
+def extract_tmdb_id_from_jellyfin_details(details) -> str | None:
+    """
+    Принимает json от get_item_details(..) и пытается вернуть TMDb ID как строку.
+    Ищем в ProviderIds.Tmdb, затем пробуем извлечь из ExternalUrls (TheMovieDb/TMDB).
+    """
+    try:
+        items = details.get("Items") or []
+        if not items:
+            return None
+        item = items[0]
 
-def is_within_last_x_days(date_str, x):
-    days_ago = datetime.now() - timedelta(days=x)
-    return date_str >= days_ago.isoformat()
+        provider_ids = item.get("ProviderIds") or {}
+        # Наиболее типичный ключ для фильмов и сериалов — "Tmdb"
+        for k in ("Tmdb", "TmdbShow", "TmdbId", "TmdbCollection"):
+            val = provider_ids.get(k)
+            if val:
+                return str(val)
+
+        # Фолбэк: иногда есть ExternalUrls → TheMovieDb
+        for ext in (item.get("ExternalUrls") or []):
+            name = (ext.get("Name") or "").lower()
+            if "themoviedb" in name or "tmdb" in name:
+                url = ext.get("Url") or ""
+                # Берём последнюю числовую часть из URL
+                import re
+                m = re.search(r"/(\d+)(?:\D*$)", url)
+                if m:
+                    return m.group(1)
+
+        return None
+    except Exception as e:
+        logging.warning(f"Failed to extract TMDb ID from Jellyfin details: {e}")
+        return None
 
 
-def is_not_within_last_x_days(date_str, x):
-    days_ago = datetime.now() - timedelta(days=x)
-    return date_str < days_ago.isoformat()
+
+def _parse_date_any(date_str: str):
+    """
+    Принимает 'YYYY-MM-DD' или 'YYYY-MM-DDTHH:MM:SS[Z]'.
+    Возвращает datetime или None, если распарсить не удалось.
+    """
+    if not date_str:
+        return None
+    try:
+        # Отрежем время, если прилетело '...T...'
+        if "T" in date_str:
+            date_str = date_str.split("T")[0]
+        return datetime.strptime(date_str, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def is_within_last_x_days(date_str: str, x: int) -> bool:
+    dt = _parse_date_any(date_str)
+    if not dt:
+        return False
+    return dt >= (datetime.now() - timedelta(days=x))
+
+
+def is_not_within_last_x_days(date_str: str, x: int) -> bool:
+    dt = _parse_date_any(date_str)
+    if not dt:
+        return True
+    return dt < (datetime.now() - timedelta(days=x))
 
 
 def get_youtube_trailer_url(query):
@@ -176,7 +228,7 @@ def get_youtube_trailer_url(query):
         'key': api_key
     }
 
-    response = requests.get(base_search_url, params=params)
+    response = requests.get(base_search_url, params=params, timeout=10)
     response.raise_for_status()  # Check for HTTP errors before processing the data
     response_data = response.json()
     video_id = response_data.get("items", [{}])[0].get('id', {}).get('videoId')
@@ -193,15 +245,14 @@ def mark_item_as_notified(item_type, item_name, release_year, max_entries=100):
     key = f"{item_type}:{item_name}:{release_year}"
     notified_items[key] = True
 
-    # Check if the number of entries in notified_items exceeds the limit
+    # Если превысили лимит — удаляем самый старый ключ (порядок вставки у dict сохраняется в Py3.7+)
     if len(notified_items) > max_entries:
-        # Get a list of keys (notification identifiers) sorted by their insertion order (oldest first)
-        keys_sorted_by_insertion_order = sorted(notified_items, key=notified_items.get)
-
-        # Remove the oldest entry from the dictionary
-        oldest_key = keys_sorted_by_insertion_order[0]
-        del notified_items[oldest_key]
-        logging.info(f"Key '{oldest_key}' has been deleted from notified_items")
+        try:
+            oldest_key = next(iter(notified_items))
+            del notified_items[oldest_key]
+            logging.info(f"Key '{oldest_key}' has been deleted from notified_items")
+        except StopIteration:
+            pass
     # Save the updated notified items to the JSON file
     save_notified_items(notified_items)
 
@@ -262,10 +313,10 @@ def announce_new_releases_from_jellyfin():
                 trailer_url = get_youtube_trailer_url(f"{series_name_cleaned} Trailer {release_year}")
 
                 # Get TMDb ID via external API
-                tmdb_id = get_tmdb_id(series_name_cleaned, release_year)
+                tmdb_id = extract_tmdb_id_from_jellyfin_details(series_details)
 
                 # **Новые строки**: получаем рейтинги для сериала
-                ratings_text = fetch_mdblist_ratings("show", tmdb_id)
+                ratings_text = fetch_mdblist_ratings("show", tmdb_id) if tmdb_id else ""
                 # Если есть рейтинги — добавляем пустую строку после них
                 ratings_section = f"{ratings_text}\n\n" if ratings_text else ""
 
@@ -402,6 +453,9 @@ def announce_new_releases_from_jellyfin():
         logging.error(f"Error: {str(e)}")
         return f"Error: {str(e)}"
 
+@app.route("/health", methods=["GET"])
+def health():
+    return "ok", 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
