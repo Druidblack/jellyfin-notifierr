@@ -717,7 +717,7 @@ def build_season_media_tech_text(series_id: str, season_id: str) -> str:
                 key=lambda v: (-v["count"], v["display"].casefold())
             )
             lines = [f"- {v['display']} — {v['count']} episodes" for v in items]
-            audio_block = "*Audio tracks (season-wide):*\n" + "\n".join(lines)
+            audio_block = "*Audio tracks:*\n" + "\n".join(lines)
 
 
         # собрать общий текст
