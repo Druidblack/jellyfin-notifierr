@@ -264,6 +264,29 @@ def _normalize_codec(codec: str | None) -> str:
     if c in ("vp9",):               return "VP9"
     return codec.upper()
 
+def _sanitize_audio_display_title(title: str) -> str:
+    """
+    Удаляет языковые префиксы в начале строки: 'ru:', 'rus:', 'eng:', '[RU]:', 'RU -', 'ru/' и т.п.
+    Оставляет остальную часть названия без изменений.
+    """
+    if not title:
+        return ""
+    import re
+    t = title.strip()
+
+    # 1) [RU]:  | (RU)  | RU:  | RU -  | RU/  | RU|
+    # а также короткие/длинные коды: ru, rus, en, eng, uk, ukr, de, ger, es, spa, fr, fre, it, ita, jp, jpn, zh, chi, pt, por, pl, pol
+    langs = r"(?:ru|rus|en|eng|uk|ukr|de|ger|es|spa|fr|fre|it|ita|jp|jpn|zh|chi|pt|por|pl|pol)"
+    # варианты с квадратными/круглыми скобками или без, затем разделитель ':' '/' '-' '|' и пробелы
+    t = re.sub(rf"^\s*(?:\[\s*{langs}\s*\]|\(\s*{langs}\s*\)|{langs})\s*[:/\-\|]\s*", "", t, flags=re.IGNORECASE)
+    # случай: просто '(RU) ' в начале без разделителя
+    t = re.sub(rf"^\s*\(\s*{langs}\s*\)\s*", "", t, flags=re.IGNORECASE)
+
+    # убрать лишние пробелы
+    t = re.sub(r"\s{2,}", " ", t).strip()
+    return t
+
+
 def _detect_image_profile(vs: dict) -> str:
     """
     Пытаемся красиво отобразить профиль изображения: Dolby Vision / HDR10 / HDR10+ / HLG / SDR.
@@ -339,17 +362,17 @@ def build_movie_media_tech_text(details_json: dict) -> str:
             audio_lines = []
             for a in audio_streams:
                 # jellyfin часто уже даёт «DisplayTitle» вида "DTS-HD MA 7.1 (eng)" и т.п.
-                acodec_disp = (a.get("DisplayTitle") or "").strip()
-                is_atmos = a.get("IsAtmos") or ("ATMOS" in acodec_disp.upper())
+                raw_disp = (a.get("DisplayTitle") or "").strip()
+                disp = _sanitize_audio_display_title(raw_disp)
+                is_atmos = a.get("IsAtmos") or ("ATMOS" in raw_disp.upper()) or ("ATMOS" in disp.upper())
 
-                if acodec_disp:
-                    # НЕ добавляем префикс "ru:"/"rus:" — как просили
-                    line = acodec_disp
-                    if is_atmos and "atmos" not in acodec_disp.lower():
+                if disp:
+                    line = disp
+                    if is_atmos and "atmos" not in disp.lower():
                         line += " (Atmos)"
                 else:
                     base = _normalize_codec(a.get("Codec"))
-                    ch   = _channels_to_layout(a.get("Channels"))
+                    ch = _channels_to_layout(a.get("Channels"))
                     lang = a.get("Language") or "und"
                     line = f"{base} {ch} ({lang})"
                     if is_atmos:
@@ -549,6 +572,177 @@ def extract_season_number_from_details(season_details: dict) -> int | None:
     except Exception:
         return None
 
+#Добавление технической информации для сезонов
+def get_season_episodes_with_files(series_id: str, season_id: str) -> list[dict]:
+    """
+    Возвращает список эпизодов сезона, у которых реально есть файл,
+    c включёнными MediaStreams для анализа кодеков/дорожек.
+    """
+    headers = {"accept": "application/json"}
+    params = {
+        "api_key": JELLYFIN_API_KEY,
+        "seasonId": season_id,
+        "isMissing": "false",
+        "Fields": "Path,LocationType,MediaSources,MediaStreams,IndexNumber,PremiereDate,SortName",
+        "limit": 10000,
+    }
+    uid = get_jellyfin_user_id()
+    if uid:
+        params["userId"] = uid
+
+    url = f"{JELLYFIN_BASE_URL}/Shows/{series_id}/Episodes"
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        items = (r.json() or {}).get("Items") or []
+        # оставляем только те, у кого реально есть файл
+        return [ep for ep in items if _episode_has_file(ep)]
+    except requests.RequestException as e:
+        logging.warning(f"Failed to fetch season episodes with files: {e}")
+        return []
+
+def _audio_label_from_stream(a: dict) -> str:
+    """
+    Единый формат для фильмов и сериалов:
+      - сначала пробуем DisplayTitle (без языкового префикса), добавим (Atmos) если нужно;
+      - если DisplayTitle пустой — используем "<CODEC> <channels> (lang)" [+ (Atmos)].
+    """
+    raw_disp = (a.get("DisplayTitle") or "").strip()
+    disp = _sanitize_audio_display_title(raw_disp)
+    is_atmos = a.get("IsAtmos") or ("ATMOS" in raw_disp.upper()) or ("ATMOS" in disp.upper())
+
+    if disp:
+        if is_atmos and "atmos" not in disp.lower():
+            disp += " (Atmos)"
+        return disp
+
+    base = _normalize_codec(a.get("Codec"))
+    ch   = _channels_to_layout(a.get("Channels"))
+    lang = a.get("Language") or "und"
+    label = f"{base} {ch} ({lang})"
+    if is_atmos:
+        label += " (Atmos)"
+    return label
+
+
+def build_season_media_tech_text(series_id: str, season_id: str) -> str:
+    """
+    Формирует блок для сообщения эпизодов:
+      *Quality (from episode 1):*
+      - Resolution: 4K (3840×1600)
+      - Video codec: HEVC (H.265)
+      - Image profiles: Dolby Vision
+
+      *Audio tracks (season-wide):*
+      - EAC3 5.1 (ru) — 6 episodes
+      - DTS-HD MA 7.1 (en) — 4 episodes
+    """
+    try:
+        eps = get_season_episodes_with_files(series_id, season_id)
+        if not eps:
+            return ""
+
+        # ----- КАЧЕСТВО ИЗ ПЕРВОЙ СЕРИИ -----
+        # сортируем по номеру эпизода (IndexNumber), затем по дате
+        def _ep_key(e):
+            idx = e.get("IndexNumber") or 10**9
+            dt  = (e.get("PremiereDate") or "9999-12-31")
+            return (idx, dt)
+        eps_sorted = sorted(eps, key=_ep_key)
+        first = eps_sorted[0]
+
+        # берём MediaStreams (из Episode прямо)
+        streams = (first.get("MediaStreams") or [])
+        if not streams:
+            # фолбэк к MediaSources[].MediaStreams
+            for ms in (first.get("MediaSources") or []):
+                if ms.get("MediaStreams"):
+                    streams = ms["MediaStreams"]
+                    break
+
+        vs = {}
+        for s in streams:
+            if (s.get("Type") or "").lower() == "video":
+                vs = s
+                break
+
+        quality_block = ""
+        if vs:
+            width  = vs.get("Width")
+            height = vs.get("Height")
+            res_label = _resolution_label(width, height)
+            vcodec = _normalize_codec(vs.get("Codec"))
+            img_profile = _detect_image_profile(vs)
+            quality_block = (
+                "*Quality:*\n"
+                f"- Resolution: {res_label}\n"
+                f"- Video codec: {vcodec}\n"
+                f"- Image profiles: {img_profile}"
+            )
+
+        # ----- АУДИО СВОДКА ПО СЕЗОНУ -----
+        # считаем, в скольких эпизодах встречается каждая уникальная дорожка (по имени),
+        # при этом объединяем варианты, отличающиеся только регистром и/или лишними пробелами
+        counters: dict[str, dict] = {}  # key -> {"count": int, "display": str}
+        for e in eps:
+            # уникальные дорожки в рамках ОДНОГО эпизода:
+            ep_keys = set()
+            s_all = (e.get("MediaStreams") or [])
+            if not s_all:
+                for ms in (e.get("MediaSources") or []):
+                    if ms.get("MediaStreams"):
+                        s_all = ms["MediaStreams"]
+                        break
+            for a in s_all:
+                if (a.get("Type") or "").lower() != "audio":
+                    continue
+                label = _audio_label_from_stream(a)  # уже без 'ru:' и т.п.
+                key = _label_key(label)
+                if not key:
+                    continue
+                if key in ep_keys:
+                    continue  # в пределах серии считаем дорожку один раз
+                ep_keys.add(key)
+
+                if key not in counters:
+                    counters[key] = {"count": 1, "display": label}
+                else:
+                    counters[key]["count"] += 1
+
+        audio_block = ""
+        if counters:
+            # сортируем по убыванию встречаемости, затем по «красивому» названию (без учёта регистра)
+            items = sorted(
+                counters.values(),
+                key=lambda v: (-v["count"], v["display"].casefold())
+            )
+            lines = [f"- {v['display']} — {v['count']} episodes" for v in items]
+            audio_block = "*Audio tracks (season-wide):*\n" + "\n".join(lines)
+
+
+        # собрать общий текст
+        parts = []
+        if quality_block:
+            parts.append(quality_block)
+        if audio_block:
+            parts.append(audio_block)
+        if not parts:
+            return ""
+        return "\n\n" + "\n\n".join(parts)
+    except Exception as e:
+        logging.warning(f"Failed to build season media tech text: {e}")
+        return ""
+
+def _label_key(s: str) -> str:
+    """
+    Нормализует название для сравнения:
+    - убирает лишние пробелы
+    - приводит к casefold() (лучше, чем lower(), для Юникода)
+    """
+    if not s:
+        return ""
+    import re
+    return re.sub(r"\s+", " ", s).strip().casefold()
 
 
 
@@ -726,7 +920,6 @@ def announce_new_releases_from_jellyfin():
                     or payload.get("Overview")
                     or ""
             )
-
             # 6) Сообщение: «добавлено N из M»
             added_line = f"*Episodes added*: {present_count}" + (f" of {planned_total}" if planned_total else "")
             notification_message = (
@@ -736,6 +929,16 @@ def announce_new_releases_from_jellyfin():
                 f"{overview_to_use}\n\n"
                 f"{added_line}"
             )
+
+            # Блок техники по сезону (по умолчанию включён через INCLUDE_MEDIA_TECH_INFO)
+            if INCLUDE_MEDIA_TECH_INFO:
+                try:
+                    season_tech = build_season_media_tech_text(series_id, season_id)
+                    if season_tech:
+                        notification_message += f"{season_tech}"
+                except Exception as e:
+                    logging.warning(f"Could not append season tech info: {e}")
+
             if ratings_text:
                 notification_message += f"\n\n*⭐Ratings show⭐:*\n{ratings_text}"
             if trailer_url:
