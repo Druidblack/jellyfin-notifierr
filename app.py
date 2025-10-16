@@ -1,6 +1,7 @@
 import logging
 from logging.handlers import TimedRotatingFileHandler
-from datetime import datetime, timedelta
+import threading, tempfile, time
+from datetime import datetime
 import os
 import json
 import requests
@@ -28,6 +29,13 @@ rotating_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %
 # Add the rotating handler to the logger
 logging.getLogger().addHandler(rotating_handler)
 
+# Базовая директория для JSON-состояний (рядом с логами/уведомлениями)
+state_directory = 'A:/notifierr'
+os.makedirs(state_directory, exist_ok=True)
+
+# Полный путь к season_counts.json (задаётся в коде, без переменных среды)
+SEASON_COUNTS_FILE = os.path.join(state_directory, 'season_counts.json')
+
 
 # Constants
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -39,6 +47,9 @@ TMDB_API_KEY = os.environ["TMDB_API_KEY"]
 TMDB_V3_BASE = "https://api.themoviedb.org/3"
 TMDB_TRAILER_LANG = os.getenv("TMDB_TRAILER_LANG", "en-US")  # пример: ru-RU, sv-SE, en-US
 INCLUDE_MEDIA_TECH_INFO = os.getenv("INCLUDE_MEDIA_TECH_INFO", "true").strip().lower() in ("1","true","yes","y","on")
+EPISODE_MSG_MIN_GAP_SEC = int(os.getenv("EPISODE_MSG_MIN_GAP_SEC", "0"))  # анти-спам: минимум N секунд между сообщениями по сезону
+JELLYFIN_USER_ID = os.getenv("JELLYFIN_USER_ID")  # опционально; если не задан, определим автоматически по токену
+
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
     """
@@ -395,6 +406,150 @@ def _resolution_label(width: int | None, height: int | None) -> str:
     # знак умножения × — аккуратнее, чем "x"
     return f"{label()} ({w}×{h})"
 
+#Добавление информации о колличестве добавлений серий (колличество из планируемых)
+_season_counts_lock = threading.Lock()
+
+def get_jellyfin_user_id() -> str | None:
+    """Определяем Id пользователя для api_key (кешируем в глобальной JELLYFIN_USER_ID)."""
+    global JELLYFIN_USER_ID
+    if JELLYFIN_USER_ID:
+        return JELLYFIN_USER_ID
+    try:
+        url = f"{JELLYFIN_BASE_URL}/Users/Me"
+        resp = requests.get(url, params={"api_key": JELLYFIN_API_KEY}, timeout=10)
+        if resp.ok:
+            JELLYFIN_USER_ID = (resp.json() or {}).get("Id")
+            return JELLYFIN_USER_ID
+    except requests.RequestException:
+        pass
+    return None
+
+def _atomic_json_write(path: str, data: dict):
+    """Безопасная запись json."""
+    tmp = None
+    try:
+        d = json.dumps(data, ensure_ascii=False, indent=2)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(d)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp and os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+def load_season_counts() -> dict:
+    try:
+        with open(SEASON_COUNTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_season_counts(data: dict) -> None:
+    try:
+        _atomic_json_write(SEASON_COUNTS_FILE, data)
+    except Exception as e:
+        logging.warning(f"Failed to save {SEASON_COUNTS_FILE}: {e}")
+
+# Глобальное состояние
+season_counts = load_season_counts()
+
+
+def _episode_has_file(ep: dict) -> bool:
+    # Признаки наличия реального файла
+    if (ep.get("LocationType") or "").lower() == "filesystem":
+        return True
+    if ep.get("Path"):
+        return True
+    if ep.get("MediaSources"):
+        return True
+    return False
+
+def get_season_episode_count(series_id: str, season_id: str) -> int:
+    """
+    Фактическое число эпизодов (только с файлами) для сезона.
+    Используем серверный фильтр isMissing=false и userId, плюс локальная фильтрация.
+    """
+    headers = {"accept": "application/json"}
+    params = {
+        "api_key": JELLYFIN_API_KEY,
+        "seasonId": season_id,
+        "isMissing": "false",                         # просим сервер не отдавать missing
+        "Fields": "Path,LocationType,MediaSources",   # чтобы можно было локально отсечь «виртуальные»
+        "limit": 10000,
+    }
+    uid = get_jellyfin_user_id()
+    if uid:
+        params["userId"] = uid                        # помогает фильтрации missing на сервере
+    url = f"{JELLYFIN_BASE_URL}/Shows/{series_id}/Episodes"
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json() or {}
+        items = data.get("Items") or []
+        actual = [ep for ep in items if _episode_has_file(ep)]
+        return len(actual)
+    except requests.RequestException as e:
+        logging.warning(f"Failed to fetch episodes for season {season_id}: {e}")
+        return 0
+
+
+
+def get_tmdb_season_total_episodes(tv_tmdb_id: str | int, season_number: int, preferred_lang: str | None = None) -> int | None:
+    """
+    Возвращает ожидаемое общее число эпизодов в сезоне по TMDb.
+    Логика фолбэка: preferred_lang → en-US → без language.
+    """
+    if not tv_tmdb_id or season_number is None:
+        return None
+
+    tries = []
+    if preferred_lang:
+        tries.append({"language": preferred_lang})
+    tries.append({"language": "en-US"})
+    tries.append({})  # без языка
+
+    for params in tries:
+        p = {"api_key": TMDB_API_KEY}
+        p.update(params)
+        url = f"{TMDB_V3_BASE}/tv/{tv_tmdb_id}/season/{int(season_number)}"
+        try:
+            r = requests.get(url, params=p, timeout=10)
+            r.raise_for_status()
+            data = r.json() or {}
+            # Обычно в ответе есть массив episodes — его длина и есть «плановое» количество.
+            episodes = data.get("episodes") or []
+            if episodes:
+                return len(episodes)
+            # На некоторых ответах встречается episode_count — используем его.
+            if "episode_count" in data and isinstance(data["episode_count"], int):
+                return data["episode_count"]
+        except requests.RequestException as e:
+            logging.warning(f"TMDb season fetch failed (tv_id={tv_tmdb_id}, S{season_number}, {params}): {e}")
+
+    return None
+
+def extract_season_number_from_details(season_details: dict) -> int | None:
+    try:
+        items = season_details.get("Items") or []
+        if not items:
+            return None
+        season_item = items[0]
+        num = season_item.get("IndexNumber")
+        if isinstance(num, int):
+            return num
+        # Фолбэк: попытка вытащить число из имени ("Season 2", "Сезон 2", "S02")
+        import re
+        name = (season_item.get("Name") or "")
+        m = re.search(r'(\d+)', name)
+        return int(m.group(1)) if m else None
+    except Exception:
+        return None
+
+
 
 
 @app.route("/webhook", methods=["POST"])
@@ -500,34 +655,109 @@ def announce_new_releases_from_jellyfin():
                     return "Season notification was sent to telegram"
 
         if item_type == "Episode":
-                item_id = payload.get("ItemId")
-                file_details = get_item_details(item_id)
-                season_id = file_details["Items"][0].get("SeasonId")
-                season_details = get_item_details(season_id)
-                series_id = season_details["Items"][0].get("SeriesId")
-                epi_name = item_name
-                overview = payload.get("Overview") or ""
-                season_epi = payload.get("EpisodeNumber00")
-                season_num = payload.get("SeasonNumber00")
+            # 1) Базовые ID
+            episode_id = payload.get("ItemId")
+            file_details = get_item_details(episode_id)
+            item0 = (file_details.get("Items") or [{}])[0]
+            season_id = item0.get("SeasonId")
+            series_id = item0.get("SeriesId")
 
-                # дата теперь не фильтрует отправку, используем её только как справочную
-                episode_premiere_date = (file_details["Items"][0].get("PremiereDate", "0000-00-00T").split("T")[0])
+            if not season_id or not series_id:
+                logging.warning("Episode payload missing SeasonId/SeriesId; skipping.")
+                return "Skipped: missing SeasonId/SeriesId", 200
 
-                notification_message = (
-                        f"*New Episode Added*\n\n*Release Date*: {episode_premiere_date}\n\n*Series*: {series_name} *S*"
-                        f"{season_num}*E*{season_epi}\n*Episode Title*: {epi_name}\n\n{overview}\n\n"
-                    )
-                response = send_telegram_photo(season_id, notification_message)
+            # 2) Детали сезона и сериала
+            season_details = get_item_details(season_id)
+            series_details = get_item_details(series_id)
+            season_item = (season_details.get("Items") or [{}])[0]
+            series_item = (series_details.get("Items") or [{}])[0]
 
-                if response.status_code == 200:
-                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
-                        return "Notification sent to Telegram!"
-                else:
-                        send_telegram_photo(series_id, notification_message)
-                        logging.warning(f"(Episode) {series_name} season image does not exists, "
-                                        f"falling back to series image")
-                        logging.info(f"(Episode) {series_name} S{season_num}E{season_epi} notification sent to Telegram!")
-                        return "Notification sent to Telegram!"
+            series_name = series_item.get("Name") or payload.get("SeriesName") or "Unknown series"
+            season_name = season_item.get("Name") or "Season"
+            release_year = series_item.get("ProductionYear") or payload.get("Year") or ""
+
+            # 3) Фактическое число серий сейчас (Jellyfin) + план (TMDb)
+            present_count = get_season_episode_count(series_id, season_id)
+
+            try:
+                series_tmdb_id = extract_tmdb_id_from_jellyfin_details(series_details)
+            except NameError:
+                series_tmdb_id = None
+
+            season_number = extract_season_number_from_details(season_details)
+            planned_total = (
+                get_tmdb_season_total_episodes(series_tmdb_id, season_number, TMDB_TRAILER_LANG)
+                if series_tmdb_id and season_number is not None else None
+            )
+
+            # 4) Анти-спам на основе состояния
+            now_ts = time.time()
+            with _season_counts_lock:
+                st = season_counts.get(season_id) or {}
+                last_sent = float(st.get("last_sent_ts") or 0)
+                last_count = int(st.get("last_count") or 0)
+
+                should_send = False
+                # отправляем, если увеличилось число эпизодов...
+                if present_count > last_count:
+                    # ...и прошло не меньше заданного окна (или сезон добит до планового числа)
+                    quiet_enough = (now_ts - last_sent) >= EPISODE_MSG_MIN_GAP_SEC
+                    completed = planned_total and present_count >= planned_total
+                    should_send = bool(quiet_enough or completed)
+
+                # обновляем «наблюдаемое» состояние (чтобы при следующем вебхуке знали актуальный счётчик)
+                st["last_count"] = present_count
+                # но метку отправки перепишем только если реально пошлём
+                season_counts[season_id] = st
+                if not should_send:
+                    save_season_counts(season_counts)
+                    logging.info(
+                        f"(Episode batch) Suppressed by anti-spam: {series_name}/{season_name} now {present_count}"
+                        + (f" of {planned_total}" if planned_total else ""))
+                    return "Suppressed by anti-spam window", 200
+
+            # 5) Доп. данные: рейтинги + трейлер по сериалу
+            ratings_text = fetch_mdblist_ratings("show", series_tmdb_id) if series_tmdb_id else ""
+            trailer_url = get_tmdb_trailer_url("tv", series_tmdb_id, TMDB_TRAILER_LANG) if series_tmdb_id else None
+
+            overview_to_use = (
+                    season_item.get("Overview")
+                    or series_item.get("Overview")
+                    or payload.get("Overview")
+                    or ""
+            )
+
+            # 6) Сообщение: «добавлено N из M»
+            added_line = f"*Episodes added*: {present_count}" + (f" of {planned_total}" if planned_total else "")
+            notification_message = (
+                f"*📺 New Episodes Added*\n\n"
+                f"*{series_name}* *({release_year})*\n\n"
+                f"*{season_name}*\n\n"
+                f"{overview_to_use}\n\n"
+                f"{added_line}"
+            )
+            if ratings_text:
+                notification_message += f"\n\n*⭐Ratings show⭐:*\n{ratings_text}"
+            if trailer_url:
+                notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+
+            # 7) Отправка (постер сезона → фолбэк на сериал)
+            response = send_telegram_photo(season_id, notification_message)
+            if response.status_code != 200:
+                send_telegram_photo(series_id, notification_message)
+                logging.warning(f"(Episode batch) Season image missing; fallback to series image.")
+
+            # 8) Зафиксировать момент отправки
+            with _season_counts_lock:
+                season_counts[season_id]["last_sent_ts"] = now_ts
+                save_season_counts(season_counts)
+
+            logging.info(
+                f"(Episode batch) {series_name}/{season_name}: sent {present_count}"
+                + (f" of {planned_total}" if planned_total else "")
+            )
+            return "Episode batch notification was sent to telegram", 200
+
 
         if item_type == "MusicAlbum":
                 album_id = payload.get("ItemId")
