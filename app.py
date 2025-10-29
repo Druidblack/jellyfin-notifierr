@@ -350,15 +350,15 @@ def build_movie_media_tech_text(details_json: dict) -> str:
         width  = vs.get("Width")
         height = vs.get("Height")
 
-        res_label = _resolution_label(width, height)
-        vcodec = _normalize_codec(vs.get("Codec"))
-        img_profile = _detect_image_profile(vs)
+        res_tag = _resolution_main_tag(width, height)
+        vcodec = _codec_class(vs.get("Codec"))
+        img_profile = _simplify_profile_label(_detect_image_profile(vs))
 
         quality_block = (
-            "*Quality:*\n"
-            f"- Resolution: {res_label}\n"
-            f"- Video codec: {vcodec}\n"
-            f"- Image profiles: {img_profile}"
+                "*Quality:*\n"
+                f"- Resolution: {res_tag}" + (" (UltraHD)" if res_tag == "4K" else "") + "\n"
+                                                                                         f"- Video codec: {vcodec}\n"
+                                                                                         f"- Image profiles: {img_profile}"
         )
 
         # ---- Аудио ----
@@ -950,7 +950,15 @@ def radarr_webhook():
                 details = get_item_details(jf_id)
                 snap = build_movie_snapshot_from_details(details)
                 rec = qs["items"].get(jf_id) or {"meta": {}, "snapshot": None, "last_notified_ts": 0}
-                rec["meta"].update({"title": title, "year": year, "tmdb_id": tmdb_id, "imdb_id": imdb_id})
+                ji = (details.get("Items") or [{}])[0]
+                display_title = ji.get("Name") or title
+                rec["meta"].update({
+                    "title": title,
+                    "display_title": display_title,
+                    "year": year,
+                    "tmdb_id": tmdb_id,
+                    "imdb_id": imdb_id
+                })
                 # Сохраняем новый снимок (может быть None, если файла нет; это ок — подождём следующего цикла)
                 rec["snapshot"] = snap
                 qs["items"][jf_id] = rec
@@ -982,9 +990,17 @@ def radarr_webhook():
             # Уже виден в Jellyfin → сразу снимок
             details = get_item_details(jf_id)
             snap = build_movie_snapshot_from_details(details)
+            ji = (details.get("Items") or [{}])[0]
+            display_title = ji.get("Name") or title  # локализованное имя из Jellyfin
             qs["items"][jf_id] = {
-                "meta": {"title": title, "year": year, "tmdb_id": tmdb_id, "imdb_id": imdb_id},
-                "snapshot": snap,  # может быть None, если файла ещё нет — дождёмся
+                "meta": {
+                    "title": title,
+                    "display_title": display_title,
+                    "year": year,
+                    "tmdb_id": tmdb_id,
+                    "imdb_id": imdb_id
+                },
+                "snapshot": snap,
                 "last_notified_ts": 0
             }
             # чистим pending для этих ID
@@ -1005,29 +1021,50 @@ def radarr_webhook():
                 return "Radarr event lacks identifiers", 200
 
 
-def _send_quality_updated_message(jf_id: str, meta: dict, old_snap: dict, new_snap: dict):
-    title = meta.get("title") or "Unknown"
-    year  = meta.get("year") or ""
+def _send_quality_updated_message(jf_id: str, meta: dict | None, old_snap: dict | None, new_snap: dict | None):
+    """
+    Сообщение в том же шаблоне, что «новый фильм», но с заголовком Quality Updated
+    и блоком техники в формате дельт (Resolution/Video codec + аудио только из новой версии).
+    """
+    if not (meta and old_snap and new_snap):
+        logging.warning(f"_send_quality_updated_message: missing inputs; skip notify (jf_id={jf_id})")
+        return
+
+    # Детали из Jellyfin — возьмём Overview/ProductionYear по возможности
+    try:
+        details = get_item_details(jf_id)
+        item = (details.get("Items") or [{}])[0]
+    except Exception:
+        item = {}
+
+    title = meta.get("display_title") or item.get("Name") or meta.get("title") or "Unknown"
+    year = meta.get("year") or item.get("ProductionYear") or ""
+    overview = item.get("Overview") or ""
+
+    # Рейтинги и трейлер — как в фильме
     tmdb_id = meta.get("tmdb_id")
-    # Рейтинги/трейлер опционально:
     ratings_text = fetch_mdblist_ratings("movie", tmdb_id) if tmdb_id else ""
     trailer_url  = get_tmdb_trailer_url("movie", tmdb_id, TMDB_TRAILER_LANG) if tmdb_id else None
 
-    before_text = snapshot_to_media_tech_text(old_snap)
-    after_text  = snapshot_to_media_tech_text(new_snap)
-
+    # Основной текст — тот же стиль, что у "New Movie Added", только шапка и тех-блок другие
     notification_message = (
         f"*🆙 Quality Updated*\n\n"
         f"*{title}* *({year})*\n\n"
-        f"*Before:*\n{before_text}\n\n"
-        f"*After:*\n{after_text}"
+        f"{overview}".strip()
     )
+
+    if INCLUDE_MEDIA_TECH_INFO:
+        delta_text = build_quality_delta_text(old_snap, new_snap)
+        if delta_text:
+            notification_message += f"\n\n{delta_text}"
+
     if ratings_text:
         notification_message += f"\n\n*⭐Ratings movie⭐:*\n{ratings_text}"
     if trailer_url:
         notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
 
     send_telegram_photo(jf_id, notification_message)
+
 
 def quality_watch_loop():
     while True:
@@ -1043,8 +1080,16 @@ def quality_watch_loop():
                             details = get_item_details(jf_id)
                             snap = build_movie_snapshot_from_details(details)
                             if snap:
+                                ji = (details.get("Items") or [{}])[0]
+                                display_title = ji.get("Name") or p.get("title")
                                 qs["items"][jf_id] = {
-                                    "meta": {"title": p.get("title"), "year": p.get("year"), "tmdb_id": p.get("tmdb_id"), "imdb_id": p.get("imdb_id")},
+                                    "meta": {
+                                        "title": p.get("title"),
+                                        "display_title": display_title,
+                                        "year": p.get("year"),
+                                        "tmdb_id": p.get("tmdb_id"),
+                                        "imdb_id": p.get("imdb_id")
+                                    },
                                     "snapshot": snap,
                                     "last_notified_ts": 0
                                 }
@@ -1085,6 +1130,104 @@ def start_quality_watcher():
     t = threading.Thread(target=quality_watch_loop, name="quality-watch", daemon=True)
     t.start()
     _quality_thread_started = True
+
+def _resolution_main_tag(width: int | None, height: int | None) -> str:
+    """Берёт короткий тег из _resolution_label: '4K (3840×1600)' -> '4K'."""
+    label = _resolution_label(width, height)
+    return (label.split()[0] if label and label != "?" else "?")
+
+def _codec_class(codec: str | None) -> str:
+    """Короткий класс кодека на базе _normalize_codec: 'HEVC (H.265)' -> 'HEVC'."""
+    norm = (_normalize_codec(codec) or "").upper()
+    if not norm:
+        return "?"
+    if "HEVC" in norm or "H.265" in norm: return "HEVC"
+    if "AVC" in norm or "H.264" in norm:  return "H264"
+    if "AV1" in norm:                     return "AV1"
+    if "VP9" in norm:                     return "VP9"
+    return norm.split()[0]
+
+def _simplify_profile_label(s: str | None) -> str:
+    """Убираем ' Profile ...' и приводим к короткому профилю, как в quality-update."""
+    txt = (s or "").strip()
+    if not txt:
+        return "SDR"
+    # выкинем ' Profile X'
+    if "Profile" in txt:
+        txt = txt.split("Profile", 1)[0].strip()
+    # нормализация основных вариантов
+    up = txt.upper()
+    if "DOLBY" in up or "DOVI" in up: return "Dolby Vision"
+    if "HDR10+" in up:                return "HDR10+"
+    if "HDR10" in up:                 return "HDR10"
+    if "HLG" in up:                   return "HLG"
+    if "SDR" in up:                   return "SDR"
+    return txt  # как есть
+
+def build_quality_delta_text(old_snap: dict, new_snap: dict) -> str:
+    """
+    Возвращает блок:
+      *Quality:*
+      - Resolution: 1080p → 4K (UltraHD)
+      - Video codec: H264 → HEVC
+
+      *Audio tracks (new):*
+      - <новые дорожки из new_snap>
+    """
+    if not (old_snap and new_snap):
+        return ""
+
+    ov = old_snap.get("video") or {}
+    nv = new_snap.get("video") or {}
+
+    old_res = _resolution_main_tag(ov.get("width"), ov.get("height"))
+    new_res = _resolution_main_tag(nv.get("width"), nv.get("height"))
+    # Добавим подпись (UltraHD) для 4K по примеру
+    new_res_suffix = " (UltraHD)" if new_res == "4K" else ""
+
+    old_codec = _codec_class(ov.get("codec"))
+    new_codec = _codec_class(nv.get("codec"))
+
+    lines = []
+    lines.append("*Quality:*")
+    if old_res != "?" and new_res != "?":
+        lines.append(f"- Resolution: {old_res} → {new_res}{new_res_suffix}")
+    else:
+        # если старое неизвестно — покажем только новое
+        lines.append(f"- Resolution: {new_res}{new_res_suffix}")
+    if old_codec != "?" and new_codec != "?":
+        lines.append(f"- Video codec: {old_codec} → {new_codec}")
+    else:
+        lines.append(f"- Video codec: {new_codec}")
+
+    # Image profiles delta
+    old_prof = (ov.get("profile") or "").strip()
+    new_prof = (nv.get("profile") or "").strip()
+
+    # если оба известны и отличаются — показываем дельту; иначе просто текущее
+    if old_prof and new_prof and old_prof != new_prof:
+        lines.append(f"- Image profiles: {old_prof} → {new_prof}")
+    elif new_prof:
+        lines.append(f"- Image profiles: {new_prof}")
+    else:
+        # если ничего не распознали — считаем SDR
+        if old_prof and old_prof != "SDR":
+            lines.append(f"- Image profiles: {old_prof} → SDR")
+        else:
+            lines.append(f"- Image profiles: SDR")
+
+    # аудио — только из нового снимка
+    new_audio = new_snap.get("audio") or []
+    lines.append("")  # пустая строка
+    lines.append("*Audio tracks (new):*")
+    if new_audio:
+        for lbl in new_audio:
+            lines.append(f"- {lbl}")
+    else:
+        lines.append("- n/a")
+
+    return "\n".join(lines)
+
 
 
 
