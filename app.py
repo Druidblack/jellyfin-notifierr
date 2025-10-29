@@ -54,6 +54,8 @@ EPISODE_MSG_MIN_GAP_SEC = int(os.getenv("EPISODE_MSG_MIN_GAP_SEC", "0"))  # ан
 JELLYFIN_USER_ID = os.getenv("JELLYFIN_USER_ID")  # опционально; если не задан, определим автоматически по токену
 # Период фоновой проверки изменений качества (в секундах)
 QUALITY_CHECK_INTERVAL_SEC = 60  # каждые 5 минут
+# Подавление "New Movie Added" после апгрейда качества (TTL)
+SUPPRESS_NEW_AFTER_QUALITY_SEC = 1800  # 2 часа
 
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
@@ -762,9 +764,10 @@ def load_quality_snapshots() -> dict:
                 return {"items": {}, "pending": []}
             data.setdefault("items", {})
             data.setdefault("pending", [])
+            data.setdefault("suppress_new", {})
             return data
     except Exception:
-        return {"items": {}, "pending": []}
+        return {"items": {}, "pending": [], "suppress_new": {}}
 
 def save_quality_snapshots(data: dict) -> None:
     try:
@@ -773,6 +776,27 @@ def save_quality_snapshots(data: dict) -> None:
         logging.warning(f"Failed to save {QUALITY_SNAPSHOTS_FILE}: {e}")
 
 quality_snapshots = load_quality_snapshots()
+
+def _migrate_quality_snapshots_to_ext_keys():
+    qs = quality_snapshots
+    items = qs.get("items") or {}
+    if not items:
+        return
+    sample_key = next(iter(items.keys()))
+    # Если уже новый формат (есть двоеточие), миграция не нужна
+    if isinstance(sample_key, str) and ":" in sample_key:
+        return
+    new_items = {}
+    for jf_key, rec in list(items.items()):
+        meta = rec.get("meta") or {}
+        ek = make_ext_key(meta.get("tmdb_id"), meta.get("imdb_id"))
+        if ek and ek not in new_items:
+            new_items[ek] = rec
+    qs["items"] = new_items
+    save_quality_snapshots(qs)
+
+_migrate_quality_snapshots_to_ext_keys()
+
 
 def _extract_streams_from_item(item: dict) -> list[dict]:
     streams = item.get("MediaStreams") or []
@@ -923,6 +947,44 @@ def find_jellyfin_movie_id_by_ids(tmdb_id: str | int | None, imdb_id: str | None
         logging.warning(f"find_jellyfin_movie_id_by_ids error: {e}")
         return None
 
+def make_ext_key(tmdb_id: str | int | None, imdb_id: str | None) -> str | None:
+    """Единый ключ фильма для трекинга: приоритет TMDb, иначе IMDb."""
+    if tmdb_id:
+        return f"tmdb:{tmdb_id}"
+    if imdb_id:
+        return f"imdb:{imdb_id}"
+    return None
+
+def _suppress_new_mark(ext_key: str, ttl: int | None = None):
+    exp = time.time() + (ttl or SUPPRESS_NEW_AFTER_QUALITY_SEC)
+    quality_snapshots["suppress_new"][ext_key] = exp
+    save_quality_snapshots(quality_snapshots)
+
+def _suppress_new_is_active(ext_key: str) -> bool:
+    exp = (quality_snapshots.get("suppress_new") or {}).get(ext_key)
+    if not exp:
+        return False
+    if time.time() <= float(exp):
+        return True
+    # просрочено — очистим запись
+    try:
+        del quality_snapshots["suppress_new"][ext_key]
+        save_quality_snapshots(quality_snapshots)
+    except Exception:
+        pass
+    return False
+
+def extract_provider_ids_from_details(details_json: dict) -> tuple[str | None, str | None]:
+    try:
+        item = (details_json.get("Items") or [{}])[0]
+        p = item.get("ProviderIds") or {}
+        tmdb = p.get("Tmdb") or p.get("TmdbId")
+        imdb = p.get("Imdb") or p.get("ImdbId")
+        return (str(tmdb) if tmdb else None, str(imdb) if imdb else None)
+    except Exception:
+        return (None, None)
+
+
 
 @app.route("/radarr", methods=["POST"])
 def radarr_webhook():
@@ -934,6 +996,11 @@ def radarr_webhook():
     imdb_id = movie.get("imdbId")
     title   = movie.get("title")
     year    = movie.get("year")
+
+    ext_key = make_ext_key(tmdb_id, imdb_id)
+    if not ext_key:
+        logging.warning("Radarr event lacks identifiers; skipping (identifier-only policy).")
+        return "Radarr event lacks identifiers", 200
 
     logging.info(f"Radarr webhook: event={event}, title={title}, year={year}, tmdb={tmdb_id}, imdb={imdb_id}")
 
@@ -949,7 +1016,7 @@ def radarr_webhook():
                 # Фильм всё ещё есть в Jellyfin — обновим (или сохраним) текущий снимок и НЕ удаляем из отслеживания.
                 details = get_item_details(jf_id)
                 snap = build_movie_snapshot_from_details(details)
-                rec = qs["items"].get(jf_id) or {"meta": {}, "snapshot": None, "last_notified_ts": 0}
+                rec = qs["items"].get(ext_key) or {"meta": {}, "snapshot": None, "last_notified_ts": 0}
                 ji = (details.get("Items") or [{}])[0]
                 display_title = ji.get("Name") or title
                 rec["meta"].update({
@@ -961,27 +1028,17 @@ def radarr_webhook():
                 })
                 # Сохраняем новый снимок (может быть None, если файла нет; это ок — подождём следующего цикла)
                 rec["snapshot"] = snap
-                qs["items"][jf_id] = rec
-                # чистим соответствующие pending
-                qs["pending"] = [p for p in qs["pending"] if not (
-                    (tmdb_id and str(p.get("tmdb_id")) == str(tmdb_id)) or
-                    (imdb_id and str(p.get("imdb_id")) == str(imdb_id))
-                )]
+                qs["items"][ext_key] = rec
+                qs["pending"] = [p for p in qs["pending"] if
+                                 make_ext_key(p.get("tmdb_id"), p.get("imdb_id")) != ext_key]
                 save_quality_snapshots(qs)
                 return "Radarr delete: kept tracking (Jellyfin still has movie)", 200
             else:
                 # Фильма нет в Jellyfin — действительно удалён. Снимаем с отслеживания по ID.
-                to_del = []
-                for id_in_jf, rec in list(qs["items"].items()):
-                    meta = rec.get("meta") or {}
-                    if (tmdb_id and str(meta.get("tmdb_id")) == str(tmdb_id)) or (imdb_id and str(meta.get("imdb_id")) == str(imdb_id)):
-                        to_del.append(id_in_jf)
-                for _id in to_del:
-                    del qs["items"][_id]
-                qs["pending"] = [p for p in qs["pending"] if not (
-                    (tmdb_id and str(p.get("tmdb_id")) == str(tmdb_id)) or
-                    (imdb_id and str(p.get("imdb_id")) == str(imdb_id))
-                )]
+                if ext_key in qs["items"]:
+                    del qs["items"][ext_key]
+                qs["pending"] = [p for p in qs["pending"] if
+                                 make_ext_key(p.get("tmdb_id"), p.get("imdb_id")) != ext_key]
                 save_quality_snapshots(qs)
                 return "Radarr delete: removed from tracking (movie missing in Jellyfin)", 200
 
@@ -992,7 +1049,7 @@ def radarr_webhook():
             snap = build_movie_snapshot_from_details(details)
             ji = (details.get("Items") or [{}])[0]
             display_title = ji.get("Name") or title  # локализованное имя из Jellyfin
-            qs["items"][jf_id] = {
+            qs["items"][ext_key] = {
                 "meta": {
                     "title": title,
                     "display_title": display_title,
@@ -1004,18 +1061,15 @@ def radarr_webhook():
                 "last_notified_ts": 0
             }
             # чистим pending для этих ID
-            qs["pending"] = [p for p in qs["pending"] if not (
-                (tmdb_id and str(p.get("tmdb_id")) == str(tmdb_id)) or
-                (imdb_id and str(p.get("imdb_id")) == str(imdb_id))
-            )]
+            qs["pending"] = [p for p in qs["pending"] if make_ext_key(p.get("tmdb_id"), p.get("imdb_id")) != ext_key]
             save_quality_snapshots(qs)
             return f"Radarr {event}: snapshot stored", 200
         else:
             # Пока не виден в Jellyfin — положим в pending (по ID), будем резолвить в фоне
             if tmdb_id or imdb_id:
-                qs["pending"].append({"tmdb_id": tmdb_id, "imdb_id": imdb_id, "title": title, "year": year, "added_ts": time.time()})
-                save_quality_snapshots(qs)
-                return f"Radarr {event}: pending (not in Jellyfin yet)", 200
+                logging.info(
+                    f"Radarr {event}: skipped tracking; movie not in Jellyfin yet (tmdb={tmdb_id}, imdb={imdb_id})")
+                return f"Radarr {event}: skipped (not in Jellyfin yet)", 200
             else:
                 logging.warning("Radarr event without identifiers; skipping (identifier-only policy).")
                 return "Radarr event lacks identifiers", 200
@@ -1064,6 +1118,9 @@ def _send_quality_updated_message(jf_id: str, meta: dict | None, old_snap: dict 
         notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
 
     send_telegram_photo(jf_id, notification_message)
+    ek = make_ext_key(meta.get("tmdb_id"), meta.get("imdb_id"))
+    if ek:
+        _suppress_new_mark(ek)
 
 
 def quality_watch_loop():
@@ -1082,7 +1139,9 @@ def quality_watch_loop():
                             if snap:
                                 ji = (details.get("Items") or [{}])[0]
                                 display_title = ji.get("Name") or p.get("title")
-                                qs["items"][jf_id] = {
+                                ek = make_ext_key(p.get("tmdb_id"), p.get("imdb_id"))
+                                if ek and snap:
+                                    qs["items"][ek] = {
                                     "meta": {
                                         "title": p.get("title"),
                                         "display_title": display_title,
@@ -1101,21 +1160,28 @@ def quality_watch_loop():
                     save_quality_snapshots(qs)
 
                 # 2) проверка изменений для уже отслеживаемых фильмов
-                for jf_id, rec in list(qs["items"].items()):
+                for ext_key, rec in list(qs["items"].items()):
+                    meta = rec.get("meta") or {}
+                    jf_id = find_jellyfin_movie_id_by_ids(meta.get("tmdb_id"), meta.get("imdb_id"))
+                    if not jf_id:
+                        continue  # фильм ещё не виден/не просканирован — ждём
+
                     details = get_item_details(jf_id)
                     new_snap = build_movie_snapshot_from_details(details)
                     if not new_snap:
-                        continue  # файла ещё нет — ждём
+                        continue
+
                     old_snap = rec.get("snapshot")
                     if snapshots_differ(old_snap, new_snap):
-                        _send_quality_updated_message(jf_id, rec.get("meta") or {}, old_snap, new_snap)
-                        # После уведомления — прекращаем отслеживание этого фильма:
+                        _send_quality_updated_message(jf_id, meta, old_snap, new_snap)
+                        # После уведомления — прекращаем отслеживание этого фильма по внешнему ключу:
                         try:
-                            del qs["items"][jf_id]
+                            del qs["items"][ext_key]
                         except KeyError:
                             pass
                         save_quality_snapshots(qs)
-                        continue  # переходим к следующему фильму
+                        continue
+
 
         except Exception as e:
             logging.warning(f"quality_watch_loop error: {e}")
@@ -1245,6 +1311,27 @@ def announce_new_releases_from_jellyfin():
 
         if item_type == "Movie":
                 movie_id = payload.get("ItemId")
+                tmdb_id = payload.get("Provider_tmdb")  # если в payload нет — возьмём из деталей
+                imdb_id = payload.get("Provider_imdb")
+
+                if not tmdb_id or not imdb_id:
+                    try:
+                        details = get_item_details(movie_id)
+                        t2, i2 = extract_provider_ids_from_details(details)
+                        tmdb_id = tmdb_id or t2
+                        imdb_id = imdb_id or i2
+                    except Exception:
+                        pass
+
+                ek = make_ext_key(tmdb_id, imdb_id)
+
+                # Подавляем если:
+                # 1) есть активная suppress-метка (только что был апгрейд),
+                # 2) или фильм сейчас отслеживается как апгрейд (есть в items).
+                if ek and (_suppress_new_is_active(ek) or ek in (quality_snapshots.get("items") or {})):
+                    logging.info(f"Suppress 'New Movie Added' for {ek}: quality upgrade in progress/recent.")
+                    return "Suppressed new movie due to quality upgrade", 200
+
                 overview = payload.get("Overview")
                 runtime = payload.get("RunTime")
                 # Remove release_year from movie_name if present
