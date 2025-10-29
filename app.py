@@ -36,6 +36,9 @@ os.makedirs(state_directory, exist_ok=True)
 # Полный путь к season_counts.json (задаётся в коде, без переменных среды)
 SEASON_COUNTS_FILE = os.path.join(state_directory, 'season_counts.json')
 
+# Храним снимки тех.характеристик фильмов, по которым будет вестись мониторинг
+QUALITY_SNAPSHOTS_FILE = os.path.join(state_directory, 'quality_snapshots.json')
+
 
 # Constants
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -49,6 +52,8 @@ TMDB_TRAILER_LANG = os.getenv("TMDB_TRAILER_LANG", "en-US")  # пример: ru-
 INCLUDE_MEDIA_TECH_INFO = os.getenv("INCLUDE_MEDIA_TECH_INFO", "true").strip().lower() in ("1","true","yes","y","on")
 EPISODE_MSG_MIN_GAP_SEC = int(os.getenv("EPISODE_MSG_MIN_GAP_SEC", "0"))  # анти-спам: минимум N секунд между сообщениями по сезону
 JELLYFIN_USER_ID = os.getenv("JELLYFIN_USER_ID")  # опционально; если не задан, определим автоматически по токену
+# Период фоновой проверки изменений качества (в секундах)
+QUALITY_CHECK_INTERVAL_SEC = 60  # каждые 5 минут
 
 
 def fetch_mdblist_ratings(content_type: str, tmdb_id: str) -> str:
@@ -744,6 +749,343 @@ def _label_key(s: str) -> str:
     import re
     return re.sub(r"\s+", " ", s).strip().casefold()
 
+#Блок отвечающий за работу с radarr
+
+_quality_lock = threading.Lock()
+
+def load_quality_snapshots() -> dict:
+    try:
+        with open(QUALITY_SNAPSHOTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            # ожидаем структуру {"items": {...}, "pending": [...]}
+            if not isinstance(data, dict):
+                return {"items": {}, "pending": []}
+            data.setdefault("items", {})
+            data.setdefault("pending", [])
+            return data
+    except Exception:
+        return {"items": {}, "pending": []}
+
+def save_quality_snapshots(data: dict) -> None:
+    try:
+        _atomic_json_write(QUALITY_SNAPSHOTS_FILE, data)
+    except Exception as e:
+        logging.warning(f"Failed to save {QUALITY_SNAPSHOTS_FILE}: {e}")
+
+quality_snapshots = load_quality_snapshots()
+
+def _extract_streams_from_item(item: dict) -> list[dict]:
+    streams = item.get("MediaStreams") or []
+    if not streams:
+        for ms in (item.get("MediaSources") or []):
+            if ms.get("MediaStreams"):
+                streams = ms["MediaStreams"]
+                break
+    return streams
+
+def _first_video_stream(streams: list[dict]) -> dict:
+    for s in streams:
+        if (s.get("Type") or "").lower() == "video":
+            return s
+    return {}
+
+def _audio_labels_from_streams(streams: list[dict]) -> list[str]:
+    labels = []
+    for a in streams:
+        if (a.get("Type") or "").lower() != "audio":
+            continue
+        label = _audio_label_from_stream(a)  # уже без префиксов rus:/ru:
+        if label:
+            labels.append(label)
+    # уникализируем по casefold + нормализуем пробелы
+    uniq = {}
+    for lbl in labels:
+        uniq[_label_key(lbl)] = lbl
+    # стабильная сортировка по display.casefold()
+    return [v for _, v in sorted(uniq.items(), key=lambda kv: kv[1].casefold())]
+
+def build_movie_snapshot_from_details(details_json: dict) -> dict | None:
+    """
+    Возвращает структурированный снимок:
+    {
+      "video": {"width": int, "height": int, "codec": str, "profile": str},
+      "audio": ["EAC3 5.1 (ru)", "DTS-HD MA 7.1 (en)"]
+    }
+    """
+    try:
+        items = details_json.get("Items") or []
+        if not items:
+            return None
+        item = items[0]
+        streams = _extract_streams_from_item(item)
+        vs = _first_video_stream(streams)
+        if not vs and not streams:
+            return None
+
+        width  = vs.get("Width")
+        height = vs.get("Height")
+        vcodec = _normalize_codec(vs.get("Codec"))
+        vprof  = _detect_image_profile(vs)
+
+        audio_labels = _audio_labels_from_streams(streams)
+
+        return {
+            "video": {
+                "width": int(width) if width else None,
+                "height": int(height) if height else None,
+                "codec": vcodec,
+                "profile": vprof,
+            },
+            "audio": audio_labels,
+        }
+    except Exception as e:
+        logging.warning(f"Failed to build movie snapshot: {e}")
+        return None
+
+def snapshot_to_media_tech_text(snap: dict) -> str:
+    """Рендерим снимок в тот же формат, что и у фильмов (Quality/Audio построчно)."""
+    if not snap:
+        return ""
+    v = snap.get("video") or {}
+    a = snap.get("audio") or []
+
+    res_label = _resolution_label(v.get("width"), v.get("height")) if (v.get("width") and v.get("height")) else "?"
+    vcodec = v.get("codec") or "?"
+    vprof  = v.get("profile") or "SDR"
+
+    lines = []
+    lines.append("*Quality:*")
+    lines.append(f"- Resolution: {res_label}")
+    lines.append(f"- Video codec: {vcodec}")
+    lines.append(f"- Image profiles: {vprof}")
+
+    lines.append("")  # пустая строка
+    lines.append("*Audio tracks:*")
+    if a:
+        for lbl in a:
+            lines.append(f"- {lbl}")
+    else:
+        lines.append("- n/a")
+
+    return "\n".join(lines)
+
+def snapshots_differ(old: dict | None, new: dict | None) -> bool:
+    """Считаем изменением только случай, когда ОБА снимка существуют и отличаются."""
+    if not old or not new:
+        return False
+    ov, nv = old.get("video") or {}, new.get("video") or {}
+    for k in ("width", "height", "codec", "profile"):
+        if (ov.get(k) != nv.get(k)):
+            return True
+    oset = {_label_key(x) for x in (old.get("audio") or [])}
+    nset = {_label_key(x) for x in (new.get("audio") or [])}
+    return oset != nset
+
+
+def find_jellyfin_movie_id_by_ids(tmdb_id: str | int | None, imdb_id: str | None) -> str | None:
+    """
+    Находит Movie в Jellyfin строго по внешним ID (TMDb/IMDb). По названию НЕ ищет.
+    Логика:
+      1) если есть оба ID — ищем совпадение обоих;
+      2) если есть только TMDb — ищем по TMDb;
+      3) если есть только IMDb — ищем по IMDb;
+      4) если нет ни одного — возвращаем None.
+    """
+    if not tmdb_id and not imdb_id:
+        return None
+
+    headers = {"accept": "application/json"}
+    params = {
+        "api_key": JELLYFIN_API_KEY,
+        "Recursive": "true",
+        "IncludeItemTypes": "Movie",
+        "Fields": "ProviderIds",
+        "Limit": 10000,  # событий мало, можно взять с запасом
+    }
+    url = f"{JELLYFIN_BASE_URL}/emby/Items"
+
+    try:
+        r = requests.get(url, headers=headers, params=params, timeout=10)
+        r.raise_for_status()
+        items = (r.json() or {}).get("Items") or []
+
+        def ok(it: dict) -> bool:
+            p = it.get("ProviderIds") or {}
+            tmdb_ok = (not tmdb_id) or (str(p.get("Tmdb") or p.get("TmdbId") or "") == str(tmdb_id))
+            imdb_ok = (not imdb_id) or (str(p.get("Imdb") or p.get("ImdbId") or "") == str(imdb_id))
+            return tmdb_ok and imdb_ok
+
+        for it in items:
+            if ok(it):
+                return it.get("Id")
+        return None
+    except requests.RequestException as e:
+        logging.warning(f"find_jellyfin_movie_id_by_ids error: {e}")
+        return None
+
+
+@app.route("/radarr", methods=["POST"])
+def radarr_webhook():
+    data = request.get_json(silent=True) or {}
+    event = (data.get("eventType") or data.get("event") or "").lower()
+    movie = data.get("movie") or {}
+
+    tmdb_id = movie.get("tmdbId")
+    imdb_id = movie.get("imdbId")
+    title   = movie.get("title")
+    year    = movie.get("year")
+
+    logging.info(f"Radarr webhook: event={event}, title={title}, year={year}, tmdb={tmdb_id}, imdb={imdb_id}")
+
+    # ВСЕГДА пробуем найти в Jellyfin строго по ID
+    jf_id = find_jellyfin_movie_id_by_ids(tmdb_id, imdb_id)
+
+    with _quality_lock:
+        qs = quality_snapshots  # {"items": {...}, "pending": [...]}
+
+        if "delete" in event:
+            # Удаление в Radarr может быть шагом апгрейда.
+            if jf_id:
+                # Фильм всё ещё есть в Jellyfin — обновим (или сохраним) текущий снимок и НЕ удаляем из отслеживания.
+                details = get_item_details(jf_id)
+                snap = build_movie_snapshot_from_details(details)
+                rec = qs["items"].get(jf_id) or {"meta": {}, "snapshot": None, "last_notified_ts": 0}
+                rec["meta"].update({"title": title, "year": year, "tmdb_id": tmdb_id, "imdb_id": imdb_id})
+                # Сохраняем новый снимок (может быть None, если файла нет; это ок — подождём следующего цикла)
+                rec["snapshot"] = snap
+                qs["items"][jf_id] = rec
+                # чистим соответствующие pending
+                qs["pending"] = [p for p in qs["pending"] if not (
+                    (tmdb_id and str(p.get("tmdb_id")) == str(tmdb_id)) or
+                    (imdb_id and str(p.get("imdb_id")) == str(imdb_id))
+                )]
+                save_quality_snapshots(qs)
+                return "Radarr delete: kept tracking (Jellyfin still has movie)", 200
+            else:
+                # Фильма нет в Jellyfin — действительно удалён. Снимаем с отслеживания по ID.
+                to_del = []
+                for id_in_jf, rec in list(qs["items"].items()):
+                    meta = rec.get("meta") or {}
+                    if (tmdb_id and str(meta.get("tmdb_id")) == str(tmdb_id)) or (imdb_id and str(meta.get("imdb_id")) == str(imdb_id)):
+                        to_del.append(id_in_jf)
+                for _id in to_del:
+                    del qs["items"][_id]
+                qs["pending"] = [p for p in qs["pending"] if not (
+                    (tmdb_id and str(p.get("tmdb_id")) == str(tmdb_id)) or
+                    (imdb_id and str(p.get("imdb_id")) == str(imdb_id))
+                )]
+                save_quality_snapshots(qs)
+                return "Radarr delete: removed from tracking (movie missing in Jellyfin)", 200
+
+        # Прочие события (grab/download/…): всегда ведём по ID
+        if jf_id:
+            # Уже виден в Jellyfin → сразу снимок
+            details = get_item_details(jf_id)
+            snap = build_movie_snapshot_from_details(details)
+            qs["items"][jf_id] = {
+                "meta": {"title": title, "year": year, "tmdb_id": tmdb_id, "imdb_id": imdb_id},
+                "snapshot": snap,  # может быть None, если файла ещё нет — дождёмся
+                "last_notified_ts": 0
+            }
+            # чистим pending для этих ID
+            qs["pending"] = [p for p in qs["pending"] if not (
+                (tmdb_id and str(p.get("tmdb_id")) == str(tmdb_id)) or
+                (imdb_id and str(p.get("imdb_id")) == str(imdb_id))
+            )]
+            save_quality_snapshots(qs)
+            return f"Radarr {event}: snapshot stored", 200
+        else:
+            # Пока не виден в Jellyfin — положим в pending (по ID), будем резолвить в фоне
+            if tmdb_id or imdb_id:
+                qs["pending"].append({"tmdb_id": tmdb_id, "imdb_id": imdb_id, "title": title, "year": year, "added_ts": time.time()})
+                save_quality_snapshots(qs)
+                return f"Radarr {event}: pending (not in Jellyfin yet)", 200
+            else:
+                logging.warning("Radarr event without identifiers; skipping (identifier-only policy).")
+                return "Radarr event lacks identifiers", 200
+
+
+def _send_quality_updated_message(jf_id: str, meta: dict, old_snap: dict, new_snap: dict):
+    title = meta.get("title") or "Unknown"
+    year  = meta.get("year") or ""
+    tmdb_id = meta.get("tmdb_id")
+    # Рейтинги/трейлер опционально:
+    ratings_text = fetch_mdblist_ratings("movie", tmdb_id) if tmdb_id else ""
+    trailer_url  = get_tmdb_trailer_url("movie", tmdb_id, TMDB_TRAILER_LANG) if tmdb_id else None
+
+    before_text = snapshot_to_media_tech_text(old_snap)
+    after_text  = snapshot_to_media_tech_text(new_snap)
+
+    notification_message = (
+        f"*🆙 Quality Updated*\n\n"
+        f"*{title}* *({year})*\n\n"
+        f"*Before:*\n{before_text}\n\n"
+        f"*After:*\n{after_text}"
+    )
+    if ratings_text:
+        notification_message += f"\n\n*⭐Ratings movie⭐:*\n{ratings_text}"
+    if trailer_url:
+        notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+
+    send_telegram_photo(jf_id, notification_message)
+
+def quality_watch_loop():
+    while True:
+        try:
+            with _quality_lock:
+                qs = quality_snapshots  # ссылка на общий dict
+                # 1) попытка резолва pending → items
+                if qs["pending"]:
+                    rest = []
+                    for p in qs["pending"]:
+                        jf_id = find_jellyfin_movie_id_by_ids(p.get("tmdb_id"), p.get("imdb_id"))
+                        if jf_id:
+                            details = get_item_details(jf_id)
+                            snap = build_movie_snapshot_from_details(details)
+                            if snap:
+                                qs["items"][jf_id] = {
+                                    "meta": {"title": p.get("title"), "year": p.get("year"), "tmdb_id": p.get("tmdb_id"), "imdb_id": p.get("imdb_id")},
+                                    "snapshot": snap,
+                                    "last_notified_ts": 0
+                                }
+                                logging.info(f"Resolved pending → snapshot stored: {p.get('title')} ({p.get('year')})")
+                            # не возвращаем в pending
+                        else:
+                            rest.append(p)  # оставим попробовать позже
+                    qs["pending"] = rest
+                    save_quality_snapshots(qs)
+
+                # 2) проверка изменений для уже отслеживаемых фильмов
+                for jf_id, rec in list(qs["items"].items()):
+                    details = get_item_details(jf_id)
+                    new_snap = build_movie_snapshot_from_details(details)
+                    if not new_snap:
+                        continue  # файла ещё нет — ждём
+                    old_snap = rec.get("snapshot")
+                    if snapshots_differ(old_snap, new_snap):
+                        _send_quality_updated_message(jf_id, rec.get("meta") or {}, old_snap, new_snap)
+                        # После уведомления — прекращаем отслеживание этого фильма:
+                        try:
+                            del qs["items"][jf_id]
+                        except KeyError:
+                            pass
+                        save_quality_snapshots(qs)
+                        continue  # переходим к следующему фильму
+
+        except Exception as e:
+            logging.warning(f"quality_watch_loop error: {e}")
+
+        time.sleep(QUALITY_CHECK_INTERVAL_SEC)
+
+_quality_thread_started = False
+def start_quality_watcher():
+    global _quality_thread_started
+    if _quality_thread_started:
+        return
+    t = threading.Thread(target=quality_watch_loop, name="quality-watch", daemon=True)
+    t.start()
+    _quality_thread_started = True
+
 
 
 @app.route("/webhook", methods=["POST"])
@@ -1021,4 +1363,5 @@ def health():
     return "ok", 200
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    start_quality_watcher()
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
