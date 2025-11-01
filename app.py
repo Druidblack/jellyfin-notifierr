@@ -428,28 +428,75 @@ def _sanitize_audio_display_title(title: str) -> str:
 
 def _detect_image_profile(vs: dict) -> str:
     """
-    Пытаемся красиво отобразить профиль изображения: Dolby Vision / HDR10 / HDR10+ / HLG / SDR.
-    Jellyfin обычно даёт поля VideoRange/VideoRangeType; если есть профиль DV — подцепим.
+    Детектирует сразу ВСЕ профили изображения из полей видео-потока:
+    Dolby Vision (с указанием Profile N), HDR10+, HDR10, HLG, общий HDR или SDR.
+    Возвращает строку вида: "Dolby Vision Profile 8, HDR10".
     """
-    rng = (vs.get("VideoRange") or "").upper()      # например: HDR10, SDR, DOLBY VISION
-    rtype = (vs.get("VideoRangeType") or "").upper()  # например: DOVI, HDR10, HLG
-    profile_hint = ""
-    # иногда профиль DV встречается в полях типа 'DolbyVisionProfile', 'DvProfile', 'VideoDoViProfile'…
-    for k, v in (vs or {}).items():
-        if "profile" in k.lower() and isinstance(v, (str, int)):
-            profile_hint = f" Profile {v}"
-            break
+    import re
 
-    if "DOVI" in rtype or "DOLBY" in rng:
-        return f"Dolby Vision{profile_hint}"
-    if "HDR10+" in rng or "HDR10+" in rtype:
-        return "HDR10+"
-    if "HDR10" in rng or "HDR10" in rtype:
-        return "HDR10"
-    if "HLG" in rng or "HLG" in rtype:
-        return "HLG"
-    # если ничего явного — считаем SDR
-    return "SDR"
+    # Соберём диагностический текст из наиболее информативных полей Jellyfin
+    txt_parts = []
+    for k in (
+        "ColorTransfer", "VideoRange", "VideoRangeType", "ColorPrimaries", "ColorSpace",
+        "Hdr", "Hdr10Plus", "DolbyVision", "DoVi", "VideoDoViProfile", "DvProfile",
+        "DolbyVisionProfile", "Profile"  # бывает, но осторожно используем
+    ):
+        v = vs.get(k)
+        if isinstance(v, bool):
+            v = "1" if v else "0"
+        if v is not None:
+            txt_parts.append(str(v))
+    txt = " ".join(txt_parts).upper()
+
+    profiles: list[str] = []
+
+    def add(label: str):
+        if label and label not in profiles:
+            profiles.append(label)
+
+    # Dolby Vision + номер профиля, если удастся извлечь
+    dv_present = ("DOLBY VISION" in txt) or ("DOVI" in txt) or (re.search(r"\bDV\b", txt) is not None)
+    if dv_present:
+        dv_profile_num = None
+        # Ищем конкретные поля с номером DV-профиля, чтобы не перепутать с AVC/HEVC Profile
+        for k, v in (vs or {}).items():
+            lk = k.lower()
+            if ("dovi" in lk or "dolby" in lk) and "profile" in lk:
+                m = re.search(r"\d+", str(v))
+                if m:
+                    dv_profile_num = m.group(0)
+                    break
+        if dv_profile_num:
+            add(f"Dolby Vision Profile {dv_profile_num}")
+        else:
+            add("Dolby Vision")
+
+    # Остальные HDR-профили
+    if ("HDR10+" in txt) or ("HDR10PLUS" in txt) or ("HDR10 PLUS" in txt):
+        add("HDR10+")
+    if "HDR10" in txt:
+        add("HDR10")
+    if "HLG" in txt:
+        add("HLG")
+
+    # Общий HDR (если нет более конкретных и есть намёки на HDR/PQ/BT2020)
+    if ("HDR" in txt or "PQ" in txt or "BT2020" in txt) and not any(
+        p in profiles for p in ("HDR10+", "HDR10", "HLG") + tuple([p for p in profiles if p.startswith("Dolby Vision")])
+    ):
+        add("HDR")
+
+    if not profiles:
+        add("SDR")
+
+    # Стабильный приоритет отображения
+    def order_key(label: str) -> int:
+        if label.startswith("Dolby Vision"):
+            return 0
+        return {"HDR10+": 1, "HDR10": 2, "HLG": 3, "HDR": 4, "SDR": 5}.get(label, 99)
+
+    profiles.sort(key=order_key)
+    return ", ".join(profiles)
+
 
 def build_movie_media_tech_text(details_json: dict) -> str:
     """
