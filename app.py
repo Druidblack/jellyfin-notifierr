@@ -952,23 +952,82 @@ def markdown_to_pushover_html(text: str) -> str:
     return s
 
 
-def clean_markdown_for_apprise(text: str | None) -> str:
-    """Убираем Markdown-разметку для plain-каналов (Email/Gotify и т.п.)."""
+def clean_markdown_for_apprise(text):
+    """
+    Упрощает markdown-подобные уведомления для plain text и приводит ссылки к единому виду:
+    - [текст](url) -> url
+    - Убирает повторяющиеся подряд одинаковые url
+    - Добавляет префикс '🎥 <перевод new_trailer>:' перед каждой ссылкой (без дублирования)
+    - Очищает лишние пробелы по краям строк
+    """
     if not text:
-        return ""
-    import re
-    t = text
-    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)  # **bold**
-    t = re.sub(r"\*(.+?)\*", r"\1", t)      # *italic*
-    t = re.sub(r"`(.+?)`", r"\1", t)        # `code`
-    t = re.sub(r"\[(.+?)\]\((.+?)\)", r"\1: \2", t)  # [text](url)
-    return t
+        return text
 
-def sanitize_whatsapp_text(text: str | None) -> str:
-    """Безопасная подпись для сервисов, которые не любят '*_[]()' и т.п."""
+    # 0) Получаем локализованную метку для "Трейлер"
+    try:
+        trailer_label = "Trailer"
+    except Exception:
+        trailer_label = "Trailer"
+    if not trailer_label:
+        trailer_label = "Trailer"
+    # 1) [текст](url) -> url
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\s)]+)\)', r'\2', text)
+
+    # 2) Убираем подряд идущие повторы одного и того же URL
+    text = re.sub(r'(https?://\S+)(\s*\1)+', r'\1', text)
+
+    # 3) Сначала убираем уже проставленные префиксы, чтобы не получить дубликаты,
+    #    затем добавим их единообразно
+    prefix_pattern = rf'🎥\s*{re.escape(trailer_label)}[:]?\s*'
+    text = re.sub(rf'{prefix_pattern}(https?://\S+)', r'\1', text)
+
+    # 4) Префиксуем ТОЛЬКО не-musicbrainz ссылки (через колбэк)
+    def _prefix_non_mb(m):
+        url = m.group(1)
+        if re.search(r'https?://(?:[^/\s)]+\.)*musicbrainz\.org(?=[/\s)]|$)', url, re.IGNORECASE):
+            return url
+        return f'🎥 {trailer_label}: {url}'
+
+    text = re.sub(r'(https?://\S+)', _prefix_non_mb, text)
+    # 5) Чистим лишние пробелы по краям строк (сохраняем переносы)
+    text = '\n'.join(line.strip() for line in text.split('\n'))
+
+    # Убрать *жирный* и _курсив_
+    text = re.sub(r'(\*|_){1,3}(.+?)\1{1,3}', r'\2', text)
+
+    return text
+
+def sanitize_whatsapp_text(text: str) -> str:
     if not text:
-        return ""
-    return text.replace("*", "").replace("_", "").replace("[", "").replace("]", "").replace("`", "")
+        return text
+
+    # Берём язык из переменной окружения
+    trailer_label = "Trailer"
+
+    # 1) Превращаем [любой текст](https://...) в просто https://...
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\2', text)
+
+    # 2) Убираем подряд идущие повторы одного и того же URL
+    text = re.sub(r'(https?://\S+)(\s*\1)+', r'\1', text)
+
+
+    # 3) Сносим уже поставленные префиксы (на всякий)
+    prefix_re = rf'🎥\s*{re.escape(trailer_label)}:?[\s]*'
+    text = re.sub(rf'{prefix_re}(https?://\S+)', r'\1', text)
+
+    # 4) Префиксуем ТОЛЬКО не-musicbrainz ссылки (через колбэк)
+    def _prefix_non_mb(m):
+        url = m.group(1)
+        if re.search(r'https?://(?:[^/\s)]+\.)*musicbrainz\.org(?=[/\s)]|$)', url, re.IGNORECASE):
+            return url
+        return f'🎥 {trailer_label} {url}'
+
+    text = re.sub(r'(https?://\S+)', _prefix_non_mb, text)
+
+    # 5) Чистим лишние пробелы
+    text = re.sub(r'[ \t]+', ' ', text).strip()
+
+    return text
 
 def _split_caption_for_reddit(caption: str) -> tuple[str, str]:
     """
