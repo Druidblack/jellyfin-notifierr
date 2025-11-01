@@ -2338,7 +2338,7 @@ def send_synology_chat_message(text: str, file_url: str | None = None) -> bool:
             # Решаем, ретраить ли
             retry_code = code2 if code2 is not None else code
             # 117 = busy/network; 411 = rate-limit "create post too fast"; 429/5xx уже будут как HTTP в detail
-            should_retry = (retry_code in (117, 411)) or ("HTTP 5" in str(detail) or "HTTP 429" in str(detail2))
+            should_retry = (retry_code in (117, 407, 411)) or ("HTTP 5" in str(detail) or "HTTP 429" in str(detail2))
 
             if not should_retry or attempt == attempts:
                 logging.warning(f"Synology Chat failed: {detail} | {detail2}")
