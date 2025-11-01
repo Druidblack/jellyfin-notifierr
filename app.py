@@ -56,6 +56,7 @@ TMDB_TRAILER_LANG = os.getenv("TMDB_TRAILER_LANG", "en-US")  # пример: ru-
 INCLUDE_MEDIA_TECH_INFO = os.getenv("INCLUDE_MEDIA_TECH_INFO", "true").strip().lower() in ("1","true","yes","y","on")
 EPISODE_MSG_MIN_GAP_SEC = int(os.getenv("EPISODE_MSG_MIN_GAP_SEC", "0"))  # анти-спам: минимум N секунд между сообщениями по сезону
 JELLYFIN_USER_ID = os.getenv("JELLYFIN_USER_ID")  # опционально; если не задан, определим автоматически по токену
+LANGUAGE = os.getenv("LANGUAGE", "ru").lower()
 
 # ----- Multi-messenger (optional) -----
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
@@ -487,11 +488,12 @@ def build_movie_media_tech_text(details_json: dict) -> str:
         vcodec = _normalize_codec(vs.get("Codec"))
         img_profile = _detect_image_profile(vs)
 
+        L = _labels()
         quality_block = (
-            "*Quality:*\n"
-            f"- Resolution: {res_label}\n"
-            f"- Video codec: {vcodec}\n"
-            f"- Image profiles: {img_profile}"
+            f"*{L['quality']}:*\n"
+            f"- {L['resolution']}: {res_label}\n"
+            f"- {L['video_codec']}: {vcodec}\n"
+            f"- {L['image_profiles']}: {img_profile}"
         )
 
         # ---- Аудио ----
@@ -518,9 +520,8 @@ def build_movie_media_tech_text(details_json: dict) -> str:
 
                 audio_lines.append(f"- {line}")
 
-            audio_block = "*Audio tracks:*\n" + "\n".join(audio_lines)
-        else:
-            audio_block = "*Audio tracks:*\n- n/a"
+            audio_block = f"*{L['audio_tracks']}:*\n" + "\n".join(
+                audio_lines) if audio_streams else f"*{L['audio_tracks']}:*\n- n/a"
 
         return f"\n\n{quality_block}\n\n{audio_block}"
     except Exception as e:
@@ -811,11 +812,12 @@ def build_season_media_tech_text(series_id: str, season_id: str) -> str:
             res_label = _resolution_label(width, height)
             vcodec = _normalize_codec(vs.get("Codec"))
             img_profile = _detect_image_profile(vs)
+            L = _labels()
             quality_block = (
-                "*Quality:*\n"
-                f"- Resolution: {res_label}\n"
-                f"- Video codec: {vcodec}\n"
-                f"- Image profiles: {img_profile}"
+                f"*{L['quality']}:*\n"
+                f"- {L['resolution']}: {res_label}\n"
+                f"- {L['video_codec']}: {vcodec}\n"
+                f"- {L['image_profiles']}: {img_profile}"
             )
 
         # ----- АУДИО СВОДКА ПО СЕЗОНУ -----
@@ -854,8 +856,8 @@ def build_season_media_tech_text(series_id: str, season_id: str) -> str:
                 counters.values(),
                 key=lambda v: (-v["count"], v["display"].casefold())
             )
-            lines = [f"- {v['display']} — {v['count']} episodes" for v in items]
-            audio_block = "*Audio tracks:*\n" + "\n".join(lines)
+            lines = [f"- {v['display']} — {v['count']} {L['episodes_word']}" for v in items]
+            audio_block = f"*{L['audio_tracks']}:*\n" + "\n".join(lines)
 
 
         # собрать общий текст
@@ -965,9 +967,9 @@ def clean_markdown_for_apprise(text):
 
     # 0) Получаем локализованную метку для "Трейлер"
     try:
-        trailer_label = "Trailer"
+        trailer_label = t("new_trailer")
     except Exception:
-        trailer_label = "Trailer"
+        trailer_label = MESSAGES.get(LANGUAGE, {}).get("new_trailer", "Trailer")
     if not trailer_label:
         trailer_label = "Trailer"
     # 1) [текст](url) -> url
@@ -1002,7 +1004,7 @@ def sanitize_whatsapp_text(text: str) -> str:
         return text
 
     # Берём язык из переменной окружения
-    trailer_label = "Trailer"
+    trailer_label = MESSAGES.get(LANGUAGE, {}).get("new_trailer")
 
     # 1) Превращаем [любой текст](https://...) в просто https://...
     text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\2', text)
@@ -2673,6 +2675,56 @@ def _safe_fetch_jellyfin_image_bytes(item_id: str) -> bytes | None:
         return None
 
 
+#Перевод
+MESSAGES = {
+    "en": {
+        "new_movie_title": "🍿New Movie Added🍿",
+        "new_season_title": "📺New Season Added📺",
+        "new_episode_title": "📺New Episode Added📺",
+        "new_album_title": "🎵New Album Added🎵",
+        "new_runtime": "🕒Runtime🕒",
+        "new_ratings_movie": "⭐Ratings movie⭐",
+        "new_ratings_show": "⭐Ratings show⭐",
+        "new_trailer": "Trailer",
+        "season_added_progress": "Added {added} of {total} episodes",
+        "season_added_count_only": "Added {added} episodes",
+        "audio_tracks": "Audio tracks",
+        "image_profiles": "Image profiles",
+    },
+    "ru": {
+        "new_movie_title": "🍿Добавлен новый фильм🍿",
+        "new_season_title": "📺Добавлен новый сезон📺",
+        "new_episode_title": "📺Добавлены новые эпизоды📺",
+        "new_album_title": "🎵Добавлен новый альбом🎵",
+        "new_runtime": "🕒Продолжительность🕒",
+        "new_ratings_movie": "⭐Рейтинги фильма⭐",
+        "new_ratings_show": "⭐Рейтинги сериала⭐",
+        "new_trailer": "Трейлер",
+        "season_added_progress": "Добавлено {added} из {total} эпизодов",
+        "season_added_count_only": "Добавлено {added} эпизодов",
+        "audio_tracks": "Аудиодорожки",
+        "image_profiles": "Профили изображения",
+    },
+}
+
+def t(key: str) -> str:
+    lang = LANGUAGE if LANGUAGE in MESSAGES else "en"
+    return MESSAGES[lang].get(key, key)
+
+def _labels() -> dict:
+    L = {
+        "quality":       {"en": "Quality",        "ru": "Качество"},
+        "resolution":    {"en": "Resolution",     "ru": "Разрешение"},
+        "video_codec":   {"en": "Video codec",    "ru": "Видеокодек"},
+        "image_profiles":{"en": "Image profiles", "ru": "Профили изображения"},
+        "audio_tracks":  {"en": "Audio tracks",   "ru": "Аудиодорожки"},
+        "episodes_word": {"en": "episodes",       "ru": "эпизодов"},
+    }
+    lang = LANGUAGE if LANGUAGE in ("ru", "en") else "en"
+    return {k: v[lang] for k, v in L.items()}
+
+
+
 
 
 @app.route("/webhook", methods=["POST"])
@@ -2698,8 +2750,11 @@ def announce_new_releases_from_jellyfin():
                 trailer_url = get_tmdb_trailer_url("movie", tmdb_id, TMDB_TRAILER_LANG)
 
                 notification_message = (
-                    f"*🍿New Movie Added🍿*\n\n*{movie_name_cleaned}* *({release_year})*\n\n{overview}\n\n"
-                    f"Runtime\n{runtime}")
+                    f"*{t('new_movie_title')}*\n\n"
+                    f"*{movie_name_cleaned}* *({release_year})*\n\n"
+                    f"{overview}\n\n"
+                    f"*{t('new_runtime')}*\n{runtime}"
+                )
 
                 # Добавляем блок качества/аудио (опционально, по умолчанию включено)
                 if INCLUDE_MEDIA_TECH_INFO:
@@ -2716,10 +2771,10 @@ def announce_new_releases_from_jellyfin():
                     mdblist_type = item_type.lower()
                     ratings_text = fetch_mdblist_ratings(mdblist_type, tmdb_id)
                     if ratings_text:
-                        notification_message += f"\n\n*⭐Ratings movie⭐:*\n{ratings_text}"
+                        notification_message += f"\n\n*{t('new_ratings_movie')}:*\n{ratings_text}"
 
                 if trailer_url:
-                    notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+                    notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
                 send_notification(movie_id, notification_message)
                 logging.info(f"(Movie) {movie_name} {release_year} notification was sent.")
@@ -2755,14 +2810,17 @@ def announce_new_releases_from_jellyfin():
                     "Overview")
 
                 notification_message = (
-                    f"*New Season Added*\n\n*{series_name_cleaned}* *({release_year})*\n\n"
-                    f"*{season}*\n\n{overview_to_use}")
+                    f"*{t('new_season_title')}*\n\n"
+                    f"*{series_name_cleaned}* *({release_year})*\n\n"
+                    f"*{season}*\n\n"
+                    f"{overview_to_use}"
+                )
 
                 if ratings_text:
-                    notification_message += f"\n\n*⭐Ratings show⭐:*\n{ratings_text}"
+                    notification_message += f"\n\n*{t('new_ratings_show')}:*\n{ratings_text}"
 
                 if trailer_url:
-                    notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+                    notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
                 target_id = season_id if jellyfin_image_exists(season_id) else series_id
                 if target_id == series_id:
@@ -2846,9 +2904,13 @@ def announce_new_releases_from_jellyfin():
                     or ""
             )
             # 6) Сообщение: «добавлено N из M»
-            added_line = f"*Episodes added*: {present_count}" + (f" of {planned_total}" if planned_total else "")
+            added_line = (
+                t('season_added_progress').format(added=present_count, total=planned_total)
+                if planned_total else
+                t('season_added_count_only').format(added=present_count)
+            )
             notification_message = (
-                f"*📺 New Episodes Added*\n\n"
+                f"*{t('new_episode_title')}*\n\n"
                 f"*{series_name}* *({release_year})*\n\n"
                 f"*{season_name}*\n\n"
                 f"{overview_to_use}\n\n"
@@ -2865,9 +2927,9 @@ def announce_new_releases_from_jellyfin():
                     logging.warning(f"Could not append season tech info: {e}")
 
             if ratings_text:
-                notification_message += f"\n\n*⭐Ratings show⭐:*\n{ratings_text}"
+                notification_message += f"\n\n*{t('new_ratings_show')}:*\n{ratings_text}"
             if trailer_url:
-                notification_message += f"\n\n[🎥]({trailer_url})[Trailer]({trailer_url})"
+                notification_message += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
 
             # 7) Отправка (постер сезона → фолбэк на сериал)
             target_id = season_id if jellyfin_image_exists(season_id) else series_id
@@ -2901,11 +2963,11 @@ def announce_new_releases_from_jellyfin():
 
                 # Шаблон уведомления
                 notification_message = (
-                    "* 🎵 New Album Added 🎵 *\n\n"
+                    f"*{t('new_album_title')}*\n\n"
                     f"*{artist}*\n\n"
                     f"*{album_name} ({year})*\n\n"
-                    f"{overview and overview + '\n\n' or ''}"
-                    f"Runtime\n{runtime}\n\n"
+                    f"{(overview + '\n\n') if overview else ''}"
+                    f"*{t('new_runtime')}*\n{runtime}\n\n"
                     f"{f'[MusicBrainz]({mb_link})' if mb_link else ''}\n"
                 )
 
