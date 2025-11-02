@@ -58,6 +58,20 @@ EPISODE_MSG_MIN_GAP_SEC = int(os.getenv("EPISODE_MSG_MIN_GAP_SEC", "0"))  # ан
 JELLYFIN_USER_ID = os.getenv("JELLYFIN_USER_ID")  # опционально; если не задан, определим автоматически по токену
 LANGUAGE = os.getenv("LANGUAGE", "ru").lower()
 
+# --- RADARR quality-upgrade tracking ---
+RADARR_ENABLED = os.getenv("RADARR_ENABLED", "1").lower() in ("1","true","yes","on")
+RADARR_WEBHOOK_SECRET = os.getenv("RADARR_WEBHOOK_SECRET", "").strip()  # опционально; передаём ?secret=...
+RADARR_PENDING_FILE = os.getenv("RADARR_PENDING_FILE", os.path.join(state_directory, "radarr_pending.json"))
+RADARR_RECHECK_AFTER_SEC = int(os.getenv("RADARR_RECHECK_AFTER_SEC", "120"))  # через сколько проверить (по умолчанию 5 мин)
+RADARR_SCAN_PERIOD_SEC = int(os.getenv("RADARR_SCAN_PERIOD_SEC", "60"))      # период тика воркера
+
+RADARR_JSON_LOCK = threading.Lock()
+# Если вдруг у Radarr нет tmdbId, можно разрешить фолбэк на IMDb:
+RADARR_USE_IMDB_FALLBACK = os.getenv("RADARR_USE_IMDB_FALLBACK", "1").lower() in ("1","true","yes","on")
+
+
+
+
 # ----- Multi-messenger (optional) -----
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 SLACK_BOT_TOKEN     = os.getenv("SLACK_BOT_TOKEN", "").strip()
@@ -2737,6 +2751,7 @@ MESSAGES = {
         "season_added_count_only": "Added {added} episodes",
         "audio_tracks": "Audio tracks",
         "image_profiles": "Image profiles",
+        "quality_updated": "🔼Quality updated🔼",
     },
     "ru": {
         "new_movie_title": "🍿Добавлен новый фильм🍿",
@@ -2751,6 +2766,7 @@ MESSAGES = {
         "season_added_count_only": "Добавлено {added} эпизодов",
         "audio_tracks": "Аудиодорожки",
         "image_profiles": "Профили изображения",
+        "quality_updated": "🔼Обновлено качество🔼",
     },
 }
 
@@ -2769,6 +2785,658 @@ def _labels() -> dict:
     }
     lang = LANGUAGE if LANGUAGE in ("ru", "en") else "en"
     return {k: v[lang] for k, v in L.items()}
+
+def _format_quality_diff_for_message(old_snap: dict, new_snap: dict) -> str:
+    """
+    *Quality:*
+    - Resolution: 1080p → 2160p
+    - Video codec: HEVC → AV1
+    - Image profiles: Dolby Vision, HDR10 → Dolby Vision, HDR10+
+    (Без аудио — аудио идёт отдельным блоком ниже)
+    """
+    L = _labels() if ('_labels' in globals() or '_labels' in dir()) else {
+        "quality":"Quality","resolution":"Resolution","video_codec":"Video codec","image_profiles":"Image profiles"
+    }
+
+    def _profiles_to_list(pf_field) -> list[str]:
+        import re
+        pool = []
+        if isinstance(pf_field, list):
+            for entry in pf_field:
+                pool += [x.strip() for x in re.split(r"\s*,\s*", str(entry)) if x.strip()]
+        elif isinstance(pf_field, str):
+            pool = [x.strip() for x in re.split(r"\s*,\s*", pf_field) if x.strip()]
+
+        def norm(lbl: str) -> str:
+            s = lbl.strip()
+            if not s: return ""
+            u = s.upper()
+            if u.startswith("DOLBY VISION PROFILE"):
+                return "Dolby Vision Profile " + "".join(ch for ch in s if ch.isdigit())
+            if "DOLBY VISION" in u:
+                return "Dolby Vision"
+            if u in ("HDR10+", "HDR10", "HLG", "HDR", "SDR"):
+                return u
+            return s
+
+        out = []
+        for x in map(norm, pool):
+            if x and x not in out:
+                out.append(x)
+        if not out:
+            out = ["SDR"]
+
+        def key_order(x: str) -> tuple:
+            if x.startswith("Dolby Vision"): return (0, x)
+            return ({"HDR10+":1,"HDR10":2,"HLG":3,"HDR":4,"SDR":5}.get(x, 99), x)
+        out.sort(key=key_order)
+        return out
+
+    old_res = old_snap.get("res_label") or "?"
+    new_res = new_snap.get("res_label") or "?"
+    old_vc  = old_snap.get("vcodec") or "?"
+    new_vc  = new_snap.get("vcodec") or "?"
+
+    old_pf = ", ".join(_profiles_to_list(old_snap.get("profiles")))
+    new_pf = ", ".join(_profiles_to_list(new_snap.get("profiles")))
+
+    lines = [
+        f"- {L['resolution']}: {old_res} → {new_res}",
+        f"- {L['video_codec']}: {old_vc} → {new_vc}",
+        f"- {L['image_profiles']}: {old_pf} → {new_pf}",
+    ]
+    return f"*{L['quality']}:*\n" + "\n".join(lines)
+
+
+#Проба отслеживания качества
+# ---------- Radarr helpers: JSON state & snapshots ----------
+
+def _load_json(path: str) -> dict:
+    with RADARR_JSON_LOCK:
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f) or {}
+        except Exception as ex:
+            logging.warning(f"Radarr: load_json failed: {ex}")
+        return {}
+
+def _store_json(path: str, data: dict) -> None:
+    with RADARR_JSON_LOCK:
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except Exception as ex:
+            logging.warning(f"Radarr: store_json failed: {ex}")
+
+def _now_ts() -> float:
+    import time as _t
+    return float(_t.time())
+
+def _snap_signature(s: dict) -> str:
+    profs = s.get("profiles");  profs = ",".join(profs) if isinstance(profs, list) else (profs or "")
+    a_sig = s.get("audio_sig"); a_sig = ",".join(a_sig) if isinstance(a_sig, list) else (a_sig or "")
+    return f"{s.get('width')}x{s.get('height')}|{(s.get('vcodec') or '').lower()}|{profs}|{a_sig}"
+
+def _format_snap_for_text(s: dict) -> str:
+    res_label = s.get("res_label") or "?"
+    vcodec = s.get("vcodec") or "?"
+    profs = s.get("profiles") or ["SDR"];  profs = ", ".join(profs) if isinstance(profs, list) else profs
+    ab = s.get("audio_best") or {}
+    ac = ab.get("codec") or "?"
+    ach = ab.get("channels") or "?"
+    atmos = " (Atmos)" if ab.get("atmos") else ""
+    return f"{res_label}, {vcodec} ({profs}) | {ac} {ach}{atmos}"
+
+
+
+def _provider_imdb_equals(item: dict, imdb_id: str) -> bool:
+    p = (item.get("ProviderIds") or {})
+    imdb_id = (imdb_id or "").strip().lower()
+    for k in ("Imdb", "ImdbId"):
+        v = p.get(k)
+        if v and str(v).strip().lower() == imdb_id:
+            return True
+    return False
+
+def _jf_find_movie_by_imdb(imdb_id: str, expected_title: str | None = None, expected_year: int | None = None):
+    imdb_id = (imdb_id or "").strip()
+    if not imdb_id:
+        return None
+    # 1) Прямой запрос AnyProviderIdEquals
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "IncludeItemTypes": "Movie",
+            "Recursive": "true",
+            "AnyProviderIdEquals": imdb_id,
+            "Fields": "ProviderIds,ProductionYear,Name,DateCreated"
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        if r.ok:
+            items = (r.json() or {}).get("Items") or []
+            cands = [it for it in items if _provider_imdb_equals(it, imdb_id)]
+            if cands:
+                # Выбор лучшего: совпадение по году → по «похожести» имени → по дате создания
+                def score(it):
+                    s = 0
+                    y = it.get("ProductionYear")
+                    if expected_year and y and int(y) == int(expected_year): s += 100
+                    if expected_title:
+                        from difflib import SequenceMatcher
+                        s += int(SequenceMatcher(None,
+                            (expected_title or "").strip().casefold(),
+                            (it.get("Name") or "").strip().casefold()).ratio() * 50)
+                    # более свежие — чутка предпочтительнее
+                    s += 1
+                    return s
+                best = sorted(cands, key=score, reverse=True)[0]
+                return best.get("Id"), best.get("Name"), best.get("ProductionYear")
+    except Exception as ex:
+        logging.debug(f"_jf_find_movie_by_imdb direct failed: {ex}")
+
+    # 2) Фолбэк: большой список + явная проверка ProviderIds.Imdb
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "IncludeItemTypes": "Movie",
+            "Recursive": "true",
+            "Fields": "ProviderIds,ProductionYear,Name",
+            "StartIndex": 0, "Limit": 10000
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=20)
+        if r.ok:
+            items = (r.json() or {}).get("Items") or []
+            cands = [it for it in items if _provider_imdb_equals(it, imdb_id)]
+            if cands:
+                # тот же скоринг
+                def score(it):
+                    s = 0
+                    y = it.get("ProductionYear")
+                    if expected_year and y and int(y) == int(expected_year): s += 100
+                    if expected_title:
+                        from difflib import SequenceMatcher
+                        s += int(SequenceMatcher(None,
+                            (expected_title or "").strip().casefold(),
+                            (it.get("Name") or "").strip().casefold()).ratio() * 50)
+                    return s
+                best = sorted(cands, key=score, reverse=True)[0]
+                return best.get("Id"), best.get("Name"), best.get("ProductionYear")
+    except Exception as ex:
+        logging.warning(f"_jf_find_movie_by_imdb fallback failed: {ex}")
+    return None
+
+def _provider_tmdb_equals(item: dict, tmdb_id: str | int) -> bool:
+    """Жёсткая проверка ProviderIds на TMDb ID (с учётом разных ключей)."""
+    p = (item.get("ProviderIds") or {})
+    s = str(tmdb_id).strip().lower()
+    for k in ("Tmdb", "TmdbId", "TheMovieDb"):
+        v = p.get(k)
+        if v is not None and str(v).strip().lower() == s:
+            return True
+    return False
+
+def _jf_find_movie_by_tmdb(tmdb_id: str | int, expected_title: str | None = None, expected_year: int | None = None):
+    """Ищем Movie по TMDb ID с валидацией ProviderIds.Tmdb и приоритизацией по году/названию."""
+    tid = str(tmdb_id).strip()
+    if not tid:
+        return None
+
+    def _score(it: dict) -> int:
+        s = 0
+        y = it.get("ProductionYear")
+        if expected_year and y and int(y) == int(expected_year):
+            s += 100
+        if expected_title:
+            from difflib import SequenceMatcher
+            s += int(
+                SequenceMatcher(None,
+                                (expected_title or "").strip().casefold(),
+                                (it.get("Name") or "").strip().casefold()
+                ).ratio() * 50
+            )
+        return s
+
+    # 1) Прямой запрос + фильтрация по ProviderIds
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "IncludeItemTypes": "Movie",
+            "Recursive": "true",
+            "AnyProviderIdEquals": tid,
+            "Fields": "ProviderIds,ProductionYear,Name,DateCreated"
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        if r.ok:
+            items = (r.json() or {}).get("Items") or []
+            cands = [it for it in items if _provider_tmdb_equals(it, tid)]
+            if cands:
+                best = sorted(cands, key=_score, reverse=True)[0]
+                return best.get("Id"), best.get("Name"), best.get("ProductionYear")
+    except Exception as ex:
+        logging.debug(f"_jf_find_movie_by_tmdb direct failed: {ex}")
+
+    # 2) Фолбэк: большой лист + явная проверка ProviderIds.Tmdb
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "IncludeItemTypes": "Movie",
+            "Recursive": "true",
+            "Fields": "ProviderIds,ProductionYear,Name",
+            "StartIndex": 0, "Limit": 10000
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=20)
+        if r.ok:
+            items = (r.json() or {}).get("Items") or []
+            cands = [it for it in items if _provider_tmdb_equals(it, tid)]
+            if cands:
+                best = sorted(cands, key=_score, reverse=True)[0]
+                return best.get("Id"), best.get("Name"), best.get("ProductionYear")
+    except Exception as ex:
+        logging.warning(f"_jf_find_movie_by_tmdb fallback failed: {ex}")
+
+    return None
+
+
+def _channels_to_float(ch) -> float:
+    # "7.1(side)" -> 7.1; 6 -> 5.1; "stereo" -> 2.0; "mono" -> 1.0
+    try:
+        import re
+        s = str(ch)
+        m = re.search(r"(\d+(?:\.\d+)?)", s)
+        if m: return float(m.group(1))
+        s = s.lower()
+        if "mono" in s: return 1.0
+        if "stereo" in s or "2ch" in s: return 2.0
+    except Exception:
+        pass
+    return 0.0
+
+def _audio_codec_rank(acodec: str) -> int:
+    s = (acodec or "").lower()
+    if "atmos" in s and ("truehd" in s or "e-ac3" in s or "dd+" in s): return 7
+    if "truehd" in s: return 6
+    if "dts-hd" in s or "dts/hd" in s or "ma" in s: return 5
+    if "flac" in s: return 5
+    if "e-ac3" in s or "dd+" in s: return 4
+    if "ac3" in s or "dolby digital" in s: return 3
+    if "aac" in s: return 2
+    if "mp3" in s: return 1
+    return 0
+
+def _build_video_snapshot_from_details(details: dict) -> dict | None:
+    try:
+        item = (details.get("Items") or [None])[0] or {}
+        # MediaStreams чаще всего в MediaSources[0].MediaStreams
+        ms = None
+        for src in (item.get("MediaSources") or []):
+            if src.get("MediaStreams"):
+                ms = src; break
+        if not ms:
+            return None
+        streams = ms.get("MediaStreams") or []
+        vs = next((s for s in streams if (s.get("Type") or "").lower()=="video"), None)
+        if not vs:
+            return None
+
+        width  = vs.get("Width"); height = vs.get("Height")
+        vcodec = _normalize_codec(vs.get("Codec"))
+
+        # ВСЕ профили изображения (DV/HDR10/HDR10+/HLG/HDR/SDR)
+        profiles_set = set()
+        base = _detect_image_profile(vs) or ""  # например: "Dolby Vision Profile 8, HDR10"
+        for tok in [x.strip() for x in re.split(r"\s*,\s*", base) if x.strip()]:
+            u = tok.upper()
+            if u.startswith("DOLBY VISION PROFILE"):
+                # сохраним с номером профиля
+                num = "".join(ch for ch in tok if ch.isdigit())
+                profiles_set.add(f"Dolby Vision Profile {num}" if num else "Dolby Vision")
+            elif "DOLBY VISION" in u:
+                profiles_set.add("Dolby Vision")
+            elif u in ("HDR10+", "HDR10", "HLG", "HDR", "SDR"):
+                profiles_set.add(u)
+
+        # 2) Доберём из VideoRange / VideoRangeType, но не дублируем
+        rng = (vs.get("VideoRange") or "").upper()
+        rtype = (vs.get("VideoRangeType") or "").upper()
+        if "HDR10+" in rng or "HDR10+" in rtype: profiles_set.add("HDR10+")
+        if "HDR10" in rng or "HDR10" in rtype: profiles_set.add("HDR10")
+        if "HLG" in rng or "HLG" in rtype: profiles_set.add("HLG")
+        if ("DOVI" in rtype or "DOLBY" in rng) and not any(p.startswith("Dolby Vision") for p in profiles_set):
+            profiles_set.add("Dolby Vision")
+
+        if not profiles_set:
+            profiles_set.add("SDR")
+
+        profiles = sorted(profiles_set, key=lambda x: (0, x) if x.startswith("Dolby Vision") else
+        ({"HDR10+": 1, "HDR10": 2, "HLG": 3, "HDR": 4, "SDR": 5}.get(x, 99), x))
+
+        # Аудио — лучший трек и «сигнатура» всех треков (codec+channels)
+        audios = [s for s in streams if (s.get("Type") or "").lower()=="audio"]
+        best_audio = None; best_score = -999
+        audio_sig_set = set()
+        for a in audios:
+            c = _normalize_codec(a.get("Codec"))
+            ch_val = a.get("Channels")
+            ch = ch_val if isinstance(ch_val, str) else (f"{ch_val}" if ch_val else "")
+            # нормализуем в человекочитаемый формат (2->2.0, 6->5.1, 8->7.1)
+            ch_label = _channels_to_layout(a.get("Channels"))
+            audio_sig_set.add(f"{c} {ch_label}")
+            score = _audio_codec_rank(c) * 10 + _channels_to_float(ch or ch_label)
+            # лёгкая эвристика на Atmos
+            disp = (a.get("DisplayTitle") or "")
+            is_atmos = bool(a.get("IsAtmos") or ("ATMOS" in str(disp).upper()))
+            if is_atmos:
+                score += 1
+            if score > best_score:
+                best_score = score
+                best_audio = {"codec": c, "channels": ch_label, "atmos": is_atmos}
+
+        res_label = _resolution_label(width, height)  # уже есть в коде :contentReference[oaicite:1]{index=1}
+        snap = {
+            "width": width, "height": height,
+            "res_label": res_label,
+            "vcodec": vcodec,
+            "profiles": sorted(profiles, key=lambda x: x.upper()),
+            "audio_best": best_audio or {"codec": "?", "channels": "?", "atmos": False},
+            "audio_sig": sorted(audio_sig_set)  # для точного сравнения
+        }
+        return snap
+    except Exception as ex:
+        logging.warning(f"snapshot build failed: {ex}")
+        return None
+
+def _extract_overview_and_runtime(details: dict) -> tuple[str, str]:
+    """Достаём overview и форматируем runtime из RunTimeTicks как HH:MM:SS (например, 00:50:42)."""
+    item0 = (details.get("Items") or [{}])[0]
+    overview = (item0.get("Overview") or "").strip()
+    ticks = item0.get("RunTimeTicks")
+    # 10_000_000 ticks = 1 секунда
+    try:
+        total_sec = int(ticks) // 10_000_000 if ticks else 0
+    except Exception:
+        total_sec = 0
+    if total_sec <= 0:
+        return overview, ""  # нет длительности — вернём пустую строку, чтобы шаблон мог пропустить блок
+
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    runtime_label = f"{h:02d}:{m:02d}:{s:02d}"
+    return overview, runtime_label
+
+
+
+def _build_audio_tracks_block_from_details(details: dict) -> str:
+    """Возвращает markdown-блок '*Audio tracks:*\\n- ...' как в шаблоне для фильма."""
+    L = _labels() if ('_labels' in globals() or '_labels' in dir()) else {
+        "audio_tracks": "Audio tracks"
+    }
+    item0 = (details.get("Items") or [{}])[0]
+    # забираем MediaStreams (обычно в MediaSources[0].MediaStreams)
+    streams = item0.get("MediaStreams") or []
+    if not streams:
+        for ms in (item0.get("MediaSources") or []):
+            if ms.get("MediaStreams"):
+                streams = ms["MediaStreams"]; break
+    audios = [s for s in streams if (s.get("Type") or "").lower() == "audio"]
+    if not audios:
+        return f"*{L['audio_tracks']}:*\n- n/a"
+    lines = []
+    for a in audios:
+        disp = (a.get("DisplayTitle") or "").strip()
+        if not disp:
+            # резерв: Codec + Channels + Language
+            codec = (a.get("Codec") or "").upper()
+            ch = a.get("Channels")
+            lang = (a.get("Language") or "").upper()
+            ch_label = _channels_to_layout(ch) if ' _channels_to_layout' in globals() or '_channels_to_layout' in dir() else (f"{ch}" if ch else "?")
+            disp = " ".join(x for x in [codec, ch_label, lang] if x)
+        lines.append(f"- {disp}")
+    return f"*{L['audio_tracks']}:*\n" + "\n".join(lines)
+
+@app.route("/radarr/webhook", methods=["POST"])
+def radarr_webhook():
+    if not RADARR_ENABLED:
+        return "radarr disabled", 200
+
+    # Опциональная защита секретом: /radarr/webhook?secret=XXX
+    secret = (request.args.get("secret") or request.headers.get("X-Radarr-Secret") or "").strip()
+    if RADARR_WEBHOOK_SECRET and secret != RADARR_WEBHOOK_SECRET:
+        logging.warning("Radarr webhook: bad secret")
+        return "forbidden", 403
+
+    data = request.get_json(silent=True) or {}
+    event = (data.get("eventType") or data.get("event") or "").lower()
+    movie = data.get("movie") or {}
+    tmdb = movie.get("tmdbId")  # может быть int
+    title = (movie.get("title") or "").strip()
+    year  = movie.get("year")
+
+    # Нас интересуют события: grab/download/upgrade/import/added/rename/delete-for-upgrade
+    interesting = {"grab", "download", "imported", "movieadded",
+                   "moviefiledelete", "moviefiledeleted", "moviefiledeleteforupgrade",
+                   "moviefilerenamed", "moviefileupgraded", "moviefileupdated"}
+    if event and event not in interesting:
+        logging.info(f"Radarr webhook: ignore event {event}")
+        return "ignored", 200
+
+    if not tmdb:
+        if RADARR_USE_IMDB_FALLBACK:
+            imdb = (movie.get("imdbId") or "").strip()
+            logging.info("Radarr webhook: tmdbId missing; trying imdb fallback")
+            jf = _jf_find_movie_by_imdb(imdb, expected_title=title, expected_year=year) if imdb else None
+        else:
+            logging.info("Radarr webhook: no tmdbId in payload")
+            return "no tmdbId", 200
+    else:
+        jf = _jf_find_movie_by_tmdb(tmdb, expected_title=title, expected_year=year)
+
+    if not jf:
+        logging.info(f"Radarr webhook: TMDb {tmdb} not found in Jellyfin (yet)")
+        return "not in jellyfin", 200
+
+    item_id, jf_name, jf_year = jf
+    details = get_item_details(item_id)
+    try:
+        item0 = (details.get("Items") or [{}])[0]
+        pids = item0.get("ProviderIds") or {}
+        got_tmdb = str(pids.get("Tmdb") or pids.get("TmdbId") or pids.get("TheMovieDb") or "").strip()
+        if tmdb and got_tmdb and str(tmdb).strip() != got_tmdb:
+            logging.warning(f"Radarr webhook: ProviderIds.Tmdb mismatch: expected {tmdb}, got {got_tmdb} — skip store")
+            return "tmdb mismatch", 200
+    except Exception:
+        pass
+
+    snap = _build_video_snapshot_from_details(details)
+    if not snap:
+        logging.info(f"Radarr webhook: cannot build snapshot for tmdb:{tmdb}")
+        return "no snapshot", 200
+
+    pend = _load_json(RADARR_PENDING_FILE)
+    key = f"tmdb:{tmdb}" if tmdb else (f"imdb:{imdb}" if RADARR_USE_IMDB_FALLBACK else None)
+    if not key:
+        return "no key", 200
+
+    pend[key] = {
+        "tmdb": str(tmdb) if tmdb else None,
+        "imdb": (movie.get("imdbId") or "").strip() if movie.get("imdbId") else None,
+        "next_check_ts": _now_ts() + RADARR_RECHECK_AFTER_SEC,
+        "movie_name": jf_name or title,
+        "year": jf_year or year,
+        "snapshot": snap,
+        "last_item_id": item_id,  # опционально: только для логов/диагностики
+    }
+    _store_json(RADARR_PENDING_FILE, pend)
+    logging.info(f"Radarr webhook: stored snapshot for {key} ({jf_name or title})")
+    return "ok", 200
+
+def _format_before_after(old: dict, new: dict) -> str:
+    return f"*{t('was')}:* { _format_snap_for_text(old) }\n*{t('now')}:* { _format_snap_for_text(new) }"
+
+def _radarr_worker_loop():
+    """
+    Background loop that checks Radarr pending entries and sends a full
+    'quality updated' message once Jellyfin has switched to the new file
+    and the quality snapshot actually differs (video + audio).
+    """
+    import time, os
+
+    while True:
+        try:
+            pend = _load_json(RADARR_PENDING_FILE)
+            if pend:
+                now = _now_ts()
+                changed = False
+                to_delete = []
+
+                for k, entry in list(pend.items()):
+                    # Wait until it's time to re-check
+                    next_ts = float(entry.get("next_check_ts") or 0.0)
+                    if now < next_ts:
+                        continue
+
+                    old_snap = entry.get("snapshot") or {}
+
+                    # Resolve current Jellyfin item by TMDb (with optional IMDb fallback)
+                    item_id, name_now, year_now = _resolve_current_item_id(entry)
+                    if not item_id:
+                        # Jellyfin hasn't indexed/linked it yet — try again later
+                        entry["next_check_ts"] = now + RADARR_RECHECK_AFTER_SEC
+                        pend[k] = entry
+                        changed = True
+                        continue
+
+                    # Pull fresh details
+                    details = get_item_details(item_id)
+
+                    # If Radarr told us the expected new file path,
+                    # wait until Jellyfin points to a file with the same basename
+                    expected_path = (entry.get("new_path") or "").strip()
+                    if expected_path:
+                        cur_path = (_jf_main_file_path_from_details(details) or "").strip()
+                        if cur_path:
+                            if os.path.basename(cur_path).lower() != os.path.basename(expected_path).lower():
+                                # Jellyfin not yet switched to the new file — postpone
+                                entry["next_check_ts"] = now + RADARR_RECHECK_AFTER_SEC
+                                pend[k] = entry
+                                changed = True
+                                continue
+
+                    # Build a new quality snapshot and compare with the stored one
+                    new_snap = _build_video_snapshot_from_details(details)
+
+                    if new_snap and _snap_signature(old_snap) != _snap_signature(new_snap):
+                        # ================== Build the full "movie-like" message ==================
+                        name = entry.get("movie_name") or name_now or "Movie"
+                        year = entry.get("year") or year_now or ""
+
+                        overview, runtime_label = _extract_overview_and_runtime(details)
+
+                        msg = f"*{t('quality_updated')}*\n\n*{name}* *({year})*"
+                        if overview:
+                            msg += f"\n\n{overview}"
+                        msg += f"\n\n*{t('new_runtime')}*\n{runtime_label}"
+
+                        # Quality diff (was → now)
+                        msg += "\n\n" + _format_quality_diff_for_message(old_snap, new_snap)
+
+                        # Audio tracks list (as in the new-movie template)
+                        msg += "\n\n" + _build_audio_tracks_block_from_details(details)
+
+                        # Ratings (MDBList via TMDb)
+                        tmdb_id = None
+                        try:
+                            item0 = (details.get("Items") or [{}])[0]
+                            pids = item0.get("ProviderIds") or {}
+                            tmdb_id = pids.get("Tmdb") or pids.get("TmdbId") or pids.get("TheMovieDb")
+                            if tmdb_id:
+                                ratings_text = fetch_mdblist_ratings("movie", tmdb_id)
+                                if ratings_text:
+                                    msg += f"\n\n*{t('new_ratings_movie')}:*\n{ratings_text}"
+                        except Exception as ex:
+                            logging.debug(f"ratings for upgrade failed: {ex}")
+
+                        # Trailer (same helper as for Movie, if present)
+                        # Trailer (как в шаблоне Movie)
+                        try:
+                            trailer_url = None
+                            if tmdb_id:
+                                trailer_url = get_tmdb_trailer_url("movie", str(tmdb_id), TMDB_TRAILER_LANG)
+                            if trailer_url:
+                                msg += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+                        except NameError:
+                            logging.debug("get_tmdb_trailer_url is not defined")
+                        except Exception as ex:
+                            logging.debug(f"trailer for upgrade failed: {ex}")
+
+                        # Send and remove the entry only after success
+                        try:
+                            send_notification(item_id, msg)
+                        except Exception as ex:
+                            logging.warning(f"Radarr worker: send_notification failed: {ex}")
+
+                        to_delete.append(k)
+
+                    else:
+                        # No changes yet — schedule next check
+                        entry["next_check_ts"] = now + RADARR_RECHECK_AFTER_SEC
+                        pend[k] = entry
+                        changed = True
+
+                # Persist changes (updated next_check_ts / deletions)
+                if to_delete:
+                    for key in to_delete:
+                        pend.pop(key, None)
+                    changed = True
+
+                if changed:
+                    _store_json(RADARR_PENDING_FILE, pend)
+
+        except Exception as ex:
+            logging.warning(f"Radarr worker loop error: {ex}")
+
+        time.sleep(RADARR_SCAN_PERIOD_SEC)
+
+def _jf_main_file_path_from_details(details: dict) -> str | None:
+    try:
+        item0 = (details.get("Items") or [{}])[0]
+        # приоритетно из MediaSources
+        for ms in (item0.get("MediaSources") or []):
+            p = ms.get("Path")
+            if p:
+                return str(p)
+        # иногда путь есть и на самом Item
+        p = item0.get("Path")
+        return str(p) if p else None
+    except Exception:
+        return None
+
+
+def _resolve_current_item_id(entry: dict) -> tuple[str|None, str|None, int|None]:
+    """Возвращает (item_id, name, year) по данным записи ожидалки."""
+    title = entry.get("movie_name")
+    year  = entry.get("year")
+    tmdb  = entry.get("tmdb")
+    imdb  = entry.get("imdb")
+
+    jf = None
+    if tmdb:
+        jf = _jf_find_movie_by_tmdb(tmdb, expected_title=title, expected_year=year)
+    if not jf and imdb and RADARR_USE_IMDB_FALLBACK:
+        jf = _jf_find_movie_by_imdb(imdb, expected_title=title, expected_year=year)
+    if jf:
+        return jf[0], jf[1], jf[2]
+    return None, None, None
+
+
 
 
 
@@ -3054,5 +3722,11 @@ def announce_new_releases_from_jellyfin():
 def health():
     return "ok", 200
 
+#if __name__ == "__main__":
+#    app.run(host="0.0.0.0", port=5000)
+
 if __name__ == "__main__":
+    if RADARR_ENABLED:
+        threading.Thread(target=_radarr_worker_loop, name="radarr-qual-worker", daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
+
