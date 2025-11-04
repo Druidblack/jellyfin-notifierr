@@ -69,6 +69,14 @@ RADARR_JSON_LOCK = threading.Lock()
 # Если вдруг у Radarr нет tmdbId, можно разрешить фолбэк на IMDb:
 RADARR_USE_IMDB_FALLBACK = os.getenv("RADARR_USE_IMDB_FALLBACK", "1").lower() in ("1","true","yes","on")
 
+# --- SONARR quality-upgrade tracking ---
+SONARR_ENABLED = os.getenv("SONARR_ENABLED", "1").lower() in ("1","true","yes","on")
+SONARR_WEBHOOK_SECRET = os.getenv("SONARR_WEBHOOK_SECRET", "").strip()  # опционально (?secret=...)
+SONARR_PENDING_FILE = os.getenv("SONARR_PENDING_FILE", os.path.join(state_directory, "sonarr_pending.json"))
+SONARR_RECHECK_AFTER_SEC = int(os.getenv("SONARR_RECHECK_AFTER_SEC", "300"))  # интервал переопроса
+SONARR_SCAN_PERIOD_SEC  = int(os.getenv("SONARR_SCAN_PERIOD_SEC",  "15"))    # период тика воркера
+
+
 
 
 
@@ -3436,6 +3444,385 @@ def _resolve_current_item_id(entry: dict) -> tuple[str|None, str|None, int|None]
         return jf[0], jf[1], jf[2]
     return None, None, None
 
+#Пробуем sonarr
+
+def _provider_tvdb_equals(item: dict, tvdb_id: str | int) -> bool:
+    p = (item.get("ProviderIds") or {})
+    s = str(tvdb_id).strip().lower()
+    for k in ("Tvdb", "TvdbId", "TheTVDB"):
+        v = p.get(k)
+        if v and str(v).strip().lower() == s:
+            return True
+    return False
+
+def _provider_tmdb_equals_series(item: dict, tmdb_id: str | int) -> bool:
+    p = (item.get("ProviderIds") or {})
+    s = str(tmdb_id).strip().lower()
+    for k in ("Tmdb", "TmdbId", "TheMovieDb"):
+        v = p.get(k)
+        if v is not None and str(v).strip().lower() == s:
+            return True
+    return False
+
+def _provider_tvmaze_equals(item: dict, tvmaze_id: str | int) -> bool:
+    p = (item.get("ProviderIds") or {})
+    s = str(tvmaze_id).strip().lower()
+    for k in ("TvMaze", "Tvmaze", "TVMazeId"):
+        v = p.get(k)
+        if v and str(v).strip().lower() == s:
+            return True
+    return False
+
+def _provider_imdb_equals_series(item: dict, imdb_id: str | int) -> bool:
+    p = (item.get("ProviderIds") or {})
+    s = str(imdb_id).strip().lower()
+    for k in ("Imdb", "ImdbId"):
+        v = p.get(k)
+        if v and str(v).strip().lower() == s:
+            return True
+    return False
+
+def _jf_find_series_candidates(fields_extra: str = "ProviderIds,ProductionYear,Name"):
+    return {
+        "api_key": JELLYFIN_API_KEY,
+        "IncludeItemTypes": "Series",
+        "Recursive": "true",
+        "Fields": fields_extra,
+        "StartIndex": 0, "Limit": 10000
+    }
+
+def _jf_find_series_by_ids(tvdb=None, tmdb=None, tvmaze=None, imdb=None, expected_title=None, expected_year=None):
+    """Возвращает (series_id, name, year) по любому из ID (приоритет: TVDB → TMDB → TVMaze → IMDb)."""
+    try:
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=_jf_find_series_candidates(), timeout=20)
+        r.raise_for_status()
+        items = (r.json() or {}).get("Items") or []
+    except Exception:
+        items = []
+
+    def score(it):
+        s = 0
+        if expected_year and int(it.get("ProductionYear") or 0) == int(expected_year): s += 3
+        if expected_title:
+            from difflib import SequenceMatcher
+            s += int(SequenceMatcher(None,
+                                     (expected_title or "").strip().casefold(),
+                                     (it.get("Name") or "").strip().casefold()).ratio() * 2)
+        return -s
+
+    # фильтрации по провайдерам
+    cands = []
+    if tvdb:  cands = [x for x in items if _provider_tvdb_equals(x, tvdb)]
+    if not cands and tmdb:   cands = [x for x in items if _provider_tmdb_equals_series(x, tmdb)]
+    if not cands and tvmaze: cands = [x for x in items if _provider_tvmaze_equals(x, tvmaze)]
+    if not cands and imdb:   cands = [x for x in items if _provider_imdb_equals_series(x, imdb)]
+    if not cands:
+        return None
+    cands.sort(key=score)
+    top = cands[0]
+    return top.get("Id"), top.get("Name"), top.get("ProductionYear")
+
+def _jf_find_season_by_index(series_id: str, season_number: int) -> tuple[str|None, str|None]:
+    try:
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "ParentId": series_id,
+            "IncludeItemTypes": "Season",
+            "Recursive": "false",
+            "Fields": "IndexNumber,Name",
+            "Limit": 200,
+        }
+        url = f"{JELLYFIN_BASE_URL}/emby/Items"
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        for it in (r.json() or {}).get("Items") or []:
+            if int(it.get("IndexNumber") or -1) == int(season_number):
+                return it.get("Id"), it.get("Name") or f"Season {season_number}"
+        return None, None
+    except Exception:
+        return None, None
+
+def _collect_season_episode_signatures(series_id: str, season_id: str, only_epnums: set[int] | None = None) -> tuple[dict, int]:
+    """
+    Возвращает (sig_by_epnum, present_count),
+    где sig_by_epnum = {episodeNumber -> signature} только для epnums (если заданы).
+    present_count — сколько эпизодов с файлами в сезоне (для сравнения с season_counts.json).
+    """
+    sigs = {}
+    present_count = 0
+    try:
+        url = f"{JELLYFIN_BASE_URL}/emby/Shows/{series_id}/Episodes"
+        params = {
+            "api_key": JELLYFIN_API_KEY,
+            "seasonId": season_id,
+            "IsMissing": "false",
+            "Fields": "IndexNumber,MediaStreams,MediaSources"
+        }
+        r = requests.get(url, params=params, timeout=20)
+        r.raise_for_status()
+        items = (r.json() or {}).get("Items") or []
+        for it in items:
+            epnum = it.get("IndexNumber")
+            if epnum is None:
+                continue
+            present_count += 1
+            epnum = int(epnum)
+            if only_epnums and epnum not in only_epnums:
+                continue
+            details = {"Items": [it]}
+            snap = _build_video_snapshot_from_details(details)
+            sig = _snap_signature(snap or {})
+            sigs[epnum] = sig
+    except Exception as ex:
+        logging.warning(f"_collect_season_episode_signatures failed: {ex}")
+    return sigs, present_count
+
+
+@app.route("/sonarr/webhook", methods=["POST"])
+def sonarr_webhook():
+    if not SONARR_ENABLED:
+        return "sonarr disabled", 200
+    if SONARR_WEBHOOK_SECRET and (request.args.get("secret") or "") != SONARR_WEBHOOK_SECRET:
+        return "forbidden", 403
+
+    p = request.get_json(silent=True, force=True) or {}
+
+    # Принимаем любые типы, где реально есть список эпизодов
+    event = (p.get("eventType") or p.get("event") or "").strip().lower()
+    # Примерно: grabbed, download, episodefileimported, episodefiledeleted, episodefilerenamed
+    episodes = p.get("episodes") or []
+    series = p.get("series") or {}
+    if not series or not episodes:
+        return "no series/episodes", 200
+
+    title = (series.get("title") or series.get("titleSlug") or "").strip()
+    year  = series.get("year")
+    tvdb  = series.get("tvdbId")
+    tmdb  = series.get("tmdbId") or series.get("tmdbid")
+    tvmz  = series.get("tvMazeId") or series.get("tvmazeId")
+    imdb  = series.get("imdbId")
+
+    # Собираем сезоны -> список эпизодов
+    by_season = {}
+    for e in episodes:
+        sn = e.get("seasonNumber")
+        en = e.get("episodeNumber")
+        if sn is None or en is None:
+            continue
+        d = by_season.setdefault(int(sn), set())
+        d.add(int(en))
+
+    if not by_season:
+        return "no season numbers", 200
+
+    pend = _load_json(SONARR_PENDING_FILE)
+    now  = _now_ts()
+    touched = 0
+
+    for season_number, ep_set in by_season.items():
+        epnums = sorted(ep_set)
+        key = f"tvdb:{tvdb}:S{season_number}" if tvdb else f"title:{title}:S{season_number}"
+        pend[key] = {
+            "tvdb": str(tvdb) if tvdb else None,
+            "tmdb": str(tmdb) if tmdb else None,
+            "tvmaze": str(tvmz) if tvmz else None,
+            "imdb": str(imdb) if imdb else None,
+            "series_title": title,
+            "release_year": year,
+            "season_number": int(season_number),
+            "epnums": epnums,                     # <— какие серии Sonarr схватил
+            "incoming_count": int(len(epnums)),   # <— сколько
+            # baseline пока не знаем: возьмём позже, когда файлы появятся в JF
+            "baseline_sigs": None,
+            "baseline_present": None,
+            "next_check_ts": now + SONARR_RECHECK_AFTER_SEC,
+            "event": event,
+        }
+        touched += 1
+
+    if touched:
+        _store_json(SONARR_PENDING_FILE, pend)
+        logging.info(f"Sonarr webhook: stored {touched} season(s) for '{title}'")
+    return "ok", 200
+
+
+def _resolve_series_from_entry(entry: dict):
+    return _jf_find_series_by_ids(
+        tvdb=entry.get("tvdb"),
+        tmdb=entry.get("tmdb"),
+        tvmaze=entry.get("tvmaze"),
+        imdb=entry.get("imdb"),
+        expected_title=entry.get("series_title"),
+        expected_year=entry.get("release_year"),
+    )
+
+def _sonarr_worker_loop():
+    while True:
+        try:
+            pend = _load_json(SONARR_PENDING_FILE)
+            if not pend:
+                time.sleep(SONARR_SCAN_PERIOD_SEC); continue
+
+            now = _now_ts()
+            changed = False
+            to_delete = []
+
+            for key, entry in list(pend.items()):
+                next_ts = float(entry.get("next_check_ts") or 0.0)
+                if now < next_ts:
+                    continue
+
+                season_number = entry.get("season_number")
+                epnums = entry.get("epnums") or []
+                incoming_count = int(entry.get("incoming_count") or 0)
+                if season_number is None or not epnums:
+                    to_delete.append(key); continue
+
+                # 1) Резолв сериала/сезона
+                found = _resolve_series_from_entry(entry)
+                if not found:
+                    entry["next_check_ts"] = now + SONARR_RECHECK_AFTER_SEC
+                    pend[key] = entry; changed = True; continue
+                series_id, series_name, release_year = found
+
+                sid, sname = _jf_find_season_by_index(series_id, int(season_number))
+                if not sid:
+                    entry["next_check_ts"] = now + SONARR_RECHECK_AFTER_SEC
+                    pend[key] = entry; changed = True; continue
+                season_id, season_name = sid, sname or f"Season {season_number}"
+
+                # 2) Сколько реальных эпизодов с файлами сейчас
+                _, present_count_all = _collect_season_episode_signatures(series_id, season_id, None)
+
+                # 3) Эталон из season_counts.json
+                with _season_counts_lock:
+                    st = season_counts.get(season_id)
+                last_count = int((st or {}).get("last_count") or 0)
+
+                # Если Sonarr тянет > чем было — это новые эпизоды, не апгрейд
+                if incoming_count > last_count:
+                    to_delete.append(key)
+                    continue
+
+                # 4) Собираем сигнатуры ТОЛЬКО по тем сериям, которые Sonarr захватил
+                want = set(int(x) for x in epnums)
+                cur_sigs, _ = _collect_season_episode_signatures(series_id, season_id, only_epnums=want)
+
+                baseline = entry.get("baseline_sigs")
+                if not baseline:
+                    # первая фиксация baseline — ждём изменений
+                    entry["baseline_sigs"] = cur_sigs
+                    entry["baseline_present"] = present_count_all
+                    entry["series_id"] = series_id
+                    entry["season_id"] = season_id
+                    entry["season_name"] = season_name
+                    entry["series_title"] = series_name or entry.get("series_title")
+                    entry["release_year"] = release_year or entry.get("release_year")
+                    entry["next_check_ts"] = now + SONARR_RECHECK_AFTER_SEC
+                    pend[key] = entry; changed = True
+                    continue
+
+                # 5) Ищем первый сдвиг
+                changed_eps = []
+                for ep in want:
+                    old = baseline.get(str(ep)) if isinstance(baseline, dict) else None
+                    if old is None:
+                        old = baseline.get(ep) if isinstance(baseline, dict) else None
+                    new = cur_sigs.get(ep)
+                    if new and old and new != old:
+                        changed_eps.append(ep)
+
+                if not changed_eps:
+                    entry["next_check_ts"] = now + SONARR_RECHECK_AFTER_SEC
+                    pend[key] = entry; changed = True
+                    continue
+
+                # ==== СЛАЕМ УВЕДОМЛЕНИЕ (шаблон как "новые серии", но с заголовком обновления) ====
+                # planned_total (опционально)
+                series_tmdb_id = entry.get("tmdb")
+                planned_total = None
+                try:
+                    if series_tmdb_id and 'get_tmdb_season_total_episodes' in globals():
+                        planned_total = get_tmdb_season_total_episodes(series_tmdb_id, int(season_number), TMDB_TRAILER_LANG)
+                except Exception as ex:
+                    logging.debug(f"sonarr planned_total failed: {ex}")
+
+                series_details = get_item_details(series_id)
+                season_details = get_item_details(season_id)
+                season_item = (season_details.get("Items") or [{}])[0]
+                series_item = (series_details.get("Items") or [{}])[0]
+                overview_to_use = (season_item.get("Overview") or series_item.get("Overview") or "").strip()
+
+                # Строка «есть X из Y» (без новых эпизодов)
+                if planned_total:
+                    added_line = t("season_added_progress").format(added=present_count_all, total=planned_total)
+                else:
+                    added_line = t("season_added_count_only").format(added=present_count_all)
+
+                # Какие серии изменились (напр., E01, E02…)
+                changed_eps_str = ", ".join(f"E{int(x):02d}" for x in sorted(changed_eps))
+
+                msg = (
+                    f"*{t('quality_updated')}*\n\n"
+                    f"*{series_name or entry.get('series_title') or 'Series'}* *({release_year or entry.get('release_year') or ''})*\n\n"
+                    f"*{season_name}*\n\n"
+                    f"{overview_to_use}\n\n"
+                    f"{added_line}\n\n"
+                    f"*Updated:* {changed_eps_str}" if changed_eps_str else
+                    f"*{t('quality_updated')}*\n\n"
+                    f"*{series_name or entry.get('series_title') or 'Series'}* *({release_year or entry.get('release_year') or ''})*\n\n"
+                    f"*{season_name}*\n\n"
+                    f"{overview_to_use}\n\n"
+                    f"{added_line}"
+                )
+
+                if INCLUDE_MEDIA_TECH_INFO:
+                    try:
+                        season_tech = build_season_media_tech_text(series_id, season_id)
+                        if season_tech:
+                            msg += season_tech
+                    except Exception as ex:
+                        logging.warning(f"Sonarr worker: season tech failed: {ex}")
+
+                # Рейтинги/трейлер по сериалу
+                try:
+                    if series_tmdb_id:
+                        ratings_text = fetch_mdblist_ratings("show", series_tmdb_id)
+                        if ratings_text:
+                            msg += f"\n\n*{t('new_ratings_show')}:*\n{ratings_text}"
+                        if 'get_tmdb_trailer_url' in globals():
+                            trailer_url = get_tmdb_trailer_url("tv", str(series_tmdb_id), TMDB_TRAILER_LANG)
+                            if trailer_url:
+                                msg += f"\n\n[🎥]({trailer_url})[{t('new_trailer')}]({trailer_url})"
+                except Exception as ex:
+                    logging.debug(f"Sonarr worker: ratings/trailer failed: {ex}")
+
+                # Куда слать постер
+                try:
+                    target_image_id = season_id if jellyfin_image_exists(season_id) else series_id
+                except Exception:
+                    target_image_id = series_id
+
+                try:
+                    send_notification(target_image_id, msg)
+                    to_delete.append(key)   # чистим ТОЛЬКО после отправки
+                except Exception as ex:
+                    logging.warning(f"Sonarr worker: send_notification failed: {ex}")
+                    entry["next_check_ts"] = now + SONARR_RECHECK_AFTER_SEC
+                    pend[key] = entry; changed = True
+
+            if to_delete:
+                for k in to_delete:
+                    pend.pop(k, None)
+                changed = True
+            if changed:
+                _store_json(SONARR_PENDING_FILE, pend)
+
+        except Exception as ex:
+            logging.warning(f"Sonarr worker loop error: {ex}")
+
+        time.sleep(SONARR_SCAN_PERIOD_SEC)
 
 
 
@@ -3728,5 +4115,7 @@ def health():
 if __name__ == "__main__":
     if RADARR_ENABLED:
         threading.Thread(target=_radarr_worker_loop, name="radarr-qual-worker", daemon=True).start()
+    if SONARR_ENABLED:
+        threading.Thread(target=_sonarr_worker_loop, name="sonarr-qual-worker", daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
 
