@@ -3771,7 +3771,7 @@ def _sonarr_worker_loop():
                     f"*{series_name or entry.get('series_title') or 'Series'}* *({release_year or entry.get('release_year') or ''})*\n\n"
                     f"*{season_name}*\n\n"
                     f"{overview_to_use}\n\n"
-                    f"*Updated:* {changed_eps_str}" if changed_eps_str else
+                    f"\n\n*{t('updated')}*: {changed_eps_str}" if changed_eps_str else
                     f"*{t('quality_updated')}*\n\n"
                     f"*{series_name or entry.get('series_title') or 'Series'}* *({release_year or entry.get('release_year') or ''})*\n\n"
                     f"*{season_name}*\n\n"
