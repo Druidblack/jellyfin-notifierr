@@ -59,7 +59,7 @@ JELLYFIN_USER_ID = os.getenv("JELLYFIN_USER_ID")  # опционально; ес
 LANGUAGE = os.getenv("LANGUAGE", "ru").lower()
 
 # --- RADARR quality-upgrade tracking ---
-RADARR_ENABLED = os.getenv("RADARR_ENABLED", "1").lower() in ("1","true","yes","on")
+RADARR_ENABLED = os.getenv("RADARR_ENABLED", "0").lower() in ("1","true","yes","on")
 RADARR_WEBHOOK_SECRET = os.getenv("RADARR_WEBHOOK_SECRET", "").strip()  # опционально; передаём ?secret=...
 RADARR_PENDING_FILE = os.getenv("RADARR_PENDING_FILE", os.path.join(state_directory, "radarr_pending.json"))
 RADARR_RECHECK_AFTER_SEC = int(os.getenv("RADARR_RECHECK_AFTER_SEC", "120"))  # через сколько проверить (по умолчанию 5 мин)
@@ -70,10 +70,10 @@ RADARR_JSON_LOCK = threading.Lock()
 RADARR_USE_IMDB_FALLBACK = os.getenv("RADARR_USE_IMDB_FALLBACK", "1").lower() in ("1","true","yes","on")
 
 # --- SONARR quality-upgrade tracking ---
-SONARR_ENABLED = os.getenv("SONARR_ENABLED", "1").lower() in ("1","true","yes","on")
+SONARR_ENABLED = os.getenv("SONARR_ENABLED", "0").lower() in ("1","true","yes","on")
 SONARR_WEBHOOK_SECRET = os.getenv("SONARR_WEBHOOK_SECRET", "").strip()  # опционально (?secret=...)
 SONARR_PENDING_FILE = os.getenv("SONARR_PENDING_FILE", os.path.join(state_directory, "sonarr_pending.json"))
-SONARR_RECHECK_AFTER_SEC = int(os.getenv("SONARR_RECHECK_AFTER_SEC", "120"))  # интервал переопроса
+SONARR_RECHECK_AFTER_SEC = int(os.getenv("SONARR_RECHECK_AFTER_SEC", "300"))  # интервал переопроса
 SONARR_SCAN_PERIOD_SEC  = int(os.getenv("SONARR_SCAN_PERIOD_SEC",  "15"))    # период тика воркера
 
 # — Автозаполнение season_counts.json при старте —
@@ -3595,13 +3595,13 @@ def sonarr_webhook():
 
     p = request.get_json(silent=True, force=True) or {}
 
-    # Разрешаем только события "grab"
+    # Разрешаем только grab-события (разные варианты поля/формата)
     event = (p.get("eventType") or p.get("event") or "").strip().lower()
+    # В Sonarr это обычно "Grab", но на всякий случай ловим подстроку.
     if not event or ("grab" not in event):
         return "ignored (not grab)", 200
-
-    series = p.get("series") or {}
     episodes = p.get("episodes") or []
+    series = p.get("series") or {}
     if not series or not episodes:
         return "no series/episodes", 200
 
@@ -3612,14 +3612,15 @@ def sonarr_webhook():
     tvmz  = series.get("tvMazeId") or series.get("tvmazeId")
     imdb  = series.get("imdbId")
 
-    # Собираем сезоны -> список эпизодов (только номера)
+    # Собираем сезоны -> список эпизодов
     by_season = {}
     for e in episodes:
         sn = e.get("seasonNumber")
         en = e.get("episodeNumber")
         if sn is None or en is None:
             continue
-        by_season.setdefault(int(sn), set()).add(int(en))
+        d = by_season.setdefault(int(sn), set())
+        d.add(int(en))
 
     if not by_season:
         return "no season numbers", 200
@@ -3630,66 +3631,7 @@ def sonarr_webhook():
 
     for season_number, ep_set in by_season.items():
         epnums = sorted(ep_set)
-        incoming_count = len(epnums)
-
-        # Пытаемся сразу резолвить сериал/сезон в Jellyfin по всем известным ID
-        found = _jf_find_series_by_ids(
-            tvdb=tvdb, tmdb=tmdb, tvmaze=tvmz, imdb=imdb,
-            expected_title=title, expected_year=year
-        )
-
-        # По умолчанию ключ по TVDB; если вдруг его нет — по title
         key = f"tvdb:{tvdb}:S{season_number}" if tvdb else f"title:{title}:S{season_number}"
-
-        if found:
-            series_id, series_name, release_year = found
-            season_id, season_name = _jf_find_season_by_index(series_id, int(season_number))
-
-            if season_id:
-                # Берём эталон из season_counts.json, чтобы отсеять кейс "новые серии"
-                with _season_counts_lock:
-                    st = season_counts.get(season_id)
-                last_count = int((st or {}).get("last_count") or 0)
-
-                if st is None:
-                    # Нет эталона — считаем первичным добавлением серий → качество не трекаем
-                    pend.pop(key, None)
-                    continue
-
-                if incoming_count > last_count:
-                    # Sonarr схватил больше, чем было — это новые серии → не трекаем апгрейд качества
-                    pend.pop(key, None)
-                    continue
-
-                # Иначе — считаем, что это потенциальный апгрейд качества:
-                # сразу соберём baseline-сигнатуры по конкретным epnums (если эпизоды уже есть в JF)
-                want = set(epnums)
-                baseline_sigs, present_count_all = _collect_season_episode_signatures(
-                    series_id, season_id, only_epnums=want
-                )
-
-                pend[key] = {
-                    "tvdb": str(tvdb) if tvdb else None,
-                    "tmdb": str(tmdb) if tmdb else None,
-                    "tvmaze": str(tvmz) if tvmz else None,
-                    "imdb": str(imdb) if imdb else None,
-                    "series_title": series_name or title,
-                    "release_year": release_year or year,
-                    "season_number": int(season_number),
-                    "epnums": epnums,
-                    "incoming_count": int(incoming_count),
-                    "series_id": series_id,
-                    "season_id": season_id,
-                    "season_name": season_name or f"Season {season_number}",
-                    "baseline_sigs": baseline_sigs or {},          # сразу сохраним, если что-то нашли
-                    "baseline_present": int(present_count_all),
-                    "next_check_ts": now + SONARR_RECHECK_AFTER_SEC,
-                    "event": "grab",
-                }
-                touched += 1
-                continue  # к следующему сезону
-
-        # Если пока не удалось резолвить сериал/сезон в JF — всё равно ставим запись (baseline доберём позже в воркере)
         pend[key] = {
             "tvdb": str(tvdb) if tvdb else None,
             "tmdb": str(tmdb) if tmdb else None,
@@ -3698,9 +3640,10 @@ def sonarr_webhook():
             "series_title": title,
             "release_year": year,
             "season_number": int(season_number),
-            "epnums": epnums,
-            "incoming_count": int(incoming_count),
-            "baseline_sigs": None,            # воркер заполнит, когда JF увидит файлы
+            "epnums": epnums,                     # <— какие серии Sonarr схватил
+            "incoming_count": int(len(epnums)),   # <— сколько
+            # baseline пока не знаем: возьмём позже, когда файлы появятся в JF
+            "baseline_sigs": None,
             "baseline_present": None,
             "next_check_ts": now + SONARR_RECHECK_AFTER_SEC,
             "event": "grab",
@@ -3711,7 +3654,6 @@ def sonarr_webhook():
         _store_json(SONARR_PENDING_FILE, pend)
         logging.info(f"Sonarr webhook (grab): stored {touched} season(s) for '{title}'")
     return "ok", 200
-
 
 
 def _resolve_series_from_entry(entry: dict):
