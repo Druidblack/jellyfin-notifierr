@@ -45,8 +45,8 @@ SEASON_COUNTS_FILE = os.path.join(state_directory, 'season_counts.json')
 
 
 # Constants
-TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 JELLYFIN_BASE_URL = os.environ["JELLYFIN_BASE_URL"]
 JELLYFIN_API_KEY = os.environ["JELLYFIN_API_KEY"]
 MDBLIST_API_KEY = os.environ["MDBLIST_API_KEY"]
@@ -76,6 +76,10 @@ SONARR_PENDING_FILE = os.getenv("SONARR_PENDING_FILE", os.path.join(state_direct
 SONARR_RECHECK_AFTER_SEC = int(os.getenv("SONARR_RECHECK_AFTER_SEC", "300"))  # интервал переопроса
 SONARR_SCAN_PERIOD_SEC  = int(os.getenv("SONARR_SCAN_PERIOD_SEC",  "15"))    # период тика воркера
 
+# — Автозаполнение season_counts.json при старте —
+SEASON_COUNTS_PRIME_ON_START = os.getenv("SEASON_COUNTS_PRIME_ON_START", "1").lower() in ("1","true","yes","on")
+SEASON_COUNTS_PRIME_PAGE_SIZE = int(os.getenv("SEASON_COUNTS_PRIME_PAGE_SIZE", "100"))  # пачка сериалов за проход
+SEASON_COUNTS_PRIME_SAVE_SEC  = float(os.getenv("SEASON_COUNTS_PRIME_SAVE_SEC", "3"))   # как часто сохранять json в процессе
 
 
 
@@ -153,7 +157,7 @@ MATRIX_ACCESS_TOKEN = os.environ.get("MATRIX_ACCESS_TOKEN", "")
 MATRIX_ROOM_ID = os.environ.get("MATRIX_ROOM_ID", "")
 
 # --- Jellyfin: In-App сообщения (в клиент) ---
-JELLYFIN_INAPP_ENABLED = os.getenv("JELLYFIN_INAPP_ENABLED", "1") == "1"
+JELLYFIN_INAPP_ENABLED = os.getenv("JELLYFIN_INAPP_ENABLED", "0") == "1"
 JELLYFIN_INAPP_TIMEOUT_MS = int(os.getenv("JELLYFIN_INAPP_TIMEOUT_MS", "800"))      # сколько висит поп-ап
 JELLYFIN_INAPP_ACTIVE_WITHIN_SEC = int(os.getenv("JELLYFIN_INAPP_ACTIVE_WITHIN_SEC", "900"))  # «активность» сессии
 JELLYFIN_INAPP_TITLE = os.getenv("JELLYFIN_INAPP_TITLE", "Jellyfin")
@@ -2516,11 +2520,12 @@ def send_notification(item_id: str, caption_markdown: str):
     # Email
     # ======= EMAIL: письмо с inline-картинкой из Jellyfin =======
     try:
-        email_ok = send_email_with_image_jellyfin(item_id, subject=SMTP_SUBJECT, body_markdown=caption_markdown)
-        if email_ok:
-            logging.info("Notification sent via Email")
-        else:
-            logging.warning("Notification failed via Email")
+        if SMTP_TO and SMTP_HOST:
+            email_ok = send_email_with_image_jellyfin(item_id, subject=SMTP_SUBJECT, body_markdown=caption_markdown)
+            if email_ok:
+                logging.info("Notification sent via Email")
+            else:
+                logging.warning("Notification failed via Email")
     except Exception as em_ex:
         logging.warning(f"Email send failed: {em_ex}")
 
@@ -2760,6 +2765,7 @@ MESSAGES = {
         "audio_tracks": "Audio tracks",
         "image_profiles": "Image profiles",
         "quality_updated": "🔼Quality updated🔼",
+        "updated": "Updated",
     },
     "ru": {
         "new_movie_title": "🍿Добавлен новый фильм🍿",
@@ -2775,6 +2781,7 @@ MESSAGES = {
         "audio_tracks": "Аудиодорожки",
         "image_profiles": "Профили изображения",
         "quality_updated": "🔼Обновлено качество🔼",
+        "updated": "Обновлено",
     },
 }
 
@@ -3588,9 +3595,11 @@ def sonarr_webhook():
 
     p = request.get_json(silent=True, force=True) or {}
 
-    # Принимаем любые типы, где реально есть список эпизодов
+    # Разрешаем только grab-события (разные варианты поля/формата)
     event = (p.get("eventType") or p.get("event") or "").strip().lower()
-    # Примерно: grabbed, download, episodefileimported, episodefiledeleted, episodefilerenamed
+    # В Sonarr это обычно "Grab", но на всякий случай ловим подстроку.
+    if not event or ("grab" not in event):
+        return "ignored (not grab)", 200
     episodes = p.get("episodes") or []
     series = p.get("series") or {}
     if not series or not episodes:
@@ -3637,13 +3646,13 @@ def sonarr_webhook():
             "baseline_sigs": None,
             "baseline_present": None,
             "next_check_ts": now + SONARR_RECHECK_AFTER_SEC,
-            "event": event,
+            "event": "grab",
         }
         touched += 1
 
     if touched:
         _store_json(SONARR_PENDING_FILE, pend)
-        logging.info(f"Sonarr webhook: stored {touched} season(s) for '{title}'")
+        logging.info(f"Sonarr webhook (grab): stored {touched} season(s) for '{title}'")
     return "ok", 200
 
 
@@ -3754,12 +3763,6 @@ def _sonarr_worker_loop():
                 series_item = (series_details.get("Items") or [{}])[0]
                 overview_to_use = (season_item.get("Overview") or series_item.get("Overview") or "").strip()
 
-                # Строка «есть X из Y» (без новых эпизодов)
-                if planned_total:
-                    added_line = t("season_added_progress").format(added=present_count_all, total=planned_total)
-                else:
-                    added_line = t("season_added_count_only").format(added=present_count_all)
-
                 # Какие серии изменились (напр., E01, E02…)
                 changed_eps_str = ", ".join(f"E{int(x):02d}" for x in sorted(changed_eps))
 
@@ -3768,13 +3771,11 @@ def _sonarr_worker_loop():
                     f"*{series_name or entry.get('series_title') or 'Series'}* *({release_year or entry.get('release_year') or ''})*\n\n"
                     f"*{season_name}*\n\n"
                     f"{overview_to_use}\n\n"
-                    f"{added_line}\n\n"
                     f"*Updated:* {changed_eps_str}" if changed_eps_str else
                     f"*{t('quality_updated')}*\n\n"
                     f"*{series_name or entry.get('series_title') or 'Series'}* *({release_year or entry.get('release_year') or ''})*\n\n"
                     f"*{season_name}*\n\n"
                     f"{overview_to_use}\n\n"
-                    f"{added_line}"
                 )
 
                 if INCLUDE_MEDIA_TECH_INFO:
@@ -3825,6 +3826,98 @@ def _sonarr_worker_loop():
         time.sleep(SONARR_SCAN_PERIOD_SEC)
 
 
+#Пробуем заполнять информацию о сезонах
+def _prime_season_counts_once():
+    """
+    Проходит все сериалы и их сезоны в Jellyfin и дополняет season_counts.json
+    начальными значениями last_count (кол-во эпизодов с файлами).
+    Существующие записи не перетирает.
+    """
+    import time
+
+    try:
+        start_index = 0
+        limit = SEASON_COUNTS_PRIME_PAGE_SIZE
+        last_save_ts = time.time()
+
+        while True:
+            # 1) Берём страницу сериалов
+            params = {
+                "api_key": JELLYFIN_API_KEY,
+                "IncludeItemTypes": "Series",
+                "Recursive": "true",
+                "Fields": "ProviderIds,ProductionYear,Name",
+                "StartIndex": start_index,
+                "Limit": limit,
+            }
+            url = f"{JELLYFIN_BASE_URL}/emby/Items"
+            try:
+                r = requests.get(url, params=params, timeout=20)
+                r.raise_for_status()
+                data = r.json() or {}
+                series_items = data.get("Items") or []
+                if not series_items:
+                    break
+            except Exception as ex:
+                logging.warning(f"Prime season_counts: series page failed at {start_index}: {ex}")
+                break
+
+            for series in series_items:
+                series_id = series.get("Id")
+                if not series_id:
+                    continue
+
+                # 2) Берём сезоны сериала (не рекурсивно)
+                try:
+                    p2 = {
+                        "api_key": JELLYFIN_API_KEY,
+                        "ParentId": series_id,
+                        "IncludeItemTypes": "Season",
+                        "Recursive": "false",
+                        "Fields": "IndexNumber,Name",
+                        "Limit": 500,
+                    }
+                    r2 = requests.get(f"{JELLYFIN_BASE_URL}/emby/Items", params=p2, timeout=15)
+                    r2.raise_for_status()
+                    seasons = (r2.json() or {}).get("Items") or []
+                except Exception as ex:
+                    logging.debug(f"Prime season_counts: list seasons failed: {ex}")
+                    continue
+
+                for season in seasons:
+                    season_id = season.get("Id")
+                    if not season_id:
+                        continue
+                    # 3) Считаем фактическое число эпизодов с файлами
+                    try:
+                        present = get_season_episode_count(series_id, season_id)
+                    except Exception as ex:
+                        logging.debug(f"Prime season_counts: count episodes failed: {ex}")
+                        continue
+
+                    # 4) Заполняем только пустые записи
+                    with _season_counts_lock:
+                        st = season_counts.get(season_id)
+                        if not st:
+                            season_counts[season_id] = {"last_count": int(present), "last_sent_ts": 0}
+                        elif "last_count" not in st:
+                            st["last_count"] = int(present)
+                            season_counts[season_id] = st
+
+                # Периодически сохраняем на диск
+                if (time.time() - last_save_ts) >= SEASON_COUNTS_PRIME_SAVE_SEC:
+                    with _season_counts_lock:
+                        save_season_counts(season_counts)
+                    last_save_ts = time.time()
+
+            start_index += limit
+
+        # Финальное сохранение
+        with _season_counts_lock:
+            save_season_counts(season_counts)
+        logging.info("Prime season_counts: completed.")
+    except Exception as ex:
+        logging.warning(f"Prime season_counts error: {ex}")
 
 
 
@@ -4117,5 +4210,7 @@ if __name__ == "__main__":
         threading.Thread(target=_radarr_worker_loop, name="radarr-qual-worker", daemon=True).start()
     if SONARR_ENABLED:
         threading.Thread(target=_sonarr_worker_loop, name="sonarr-qual-worker", daemon=True).start()
+    if SEASON_COUNTS_PRIME_ON_START:
+        threading.Thread(target=_prime_season_counts_once, name="season-counts-prime", daemon=True).start()
     app.run(host="0.0.0.0", port=5000)
 
